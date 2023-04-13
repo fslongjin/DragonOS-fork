@@ -51,13 +51,13 @@ extern int process_init_files();
 extern int rs_init_stdio();
 
 // 设置初始进程的PCB
-#define INITIAL_PROC(proc)                                                                                             \
-    {                                                                                                                  \
-        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,              \
-        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,       \
-        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0,   \
-        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                   \
-        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                       \
+#define INITIAL_PROC(proc)                                                                                           \
+    {                                                                                                                \
+        .state = PROC_UNINTERRUPTIBLE, .flags = PF_KTHREAD, .preempt_count = 0, .signal = 0, .cpu_id = 0,            \
+        .mm = &initial_mm, .thread = &initial_thread, .addr_limit = 0xffffffffffffffff, .pid = 0, .priority = 2,     \
+        .virtual_runtime = 0, .fds = {0}, .next_pcb = &proc, .prev_pcb = &proc, .parent_pcb = &proc, .exit_code = 0, \
+        .wait_child_proc_exit = 0, .worker_private = NULL, .policy = SCHED_NORMAL, .sig_blocked = 0,                 \
+        .signal = &INITIAL_SIGNALS, .sighand = &INITIAL_SIGHAND,                                                     \
     }
 
 struct thread_struct initial_thread = {
@@ -114,8 +114,10 @@ void __switch_to(struct process_control_block *prev, struct process_control_bloc
     //           initial_tss[0].ist2, initial_tss[0].ist3, initial_tss[0].ist4, initial_tss[0].ist5,
     //           initial_tss[0].ist6, initial_tss[0].ist7);
 
-    __asm__ __volatile__("movq	%%fs,	%0 \n\t" : "=a"(prev->thread->fs));
-    __asm__ __volatile__("movq	%%gs,	%0 \n\t" : "=a"(prev->thread->gs));
+    __asm__ __volatile__("movq	%%fs,	%0 \n\t"
+                         : "=a"(prev->thread->fs));
+    __asm__ __volatile__("movq	%%gs,	%0 \n\t"
+                         : "=a"(prev->thread->gs));
 
     __asm__ __volatile__("movq	%0,	%%fs \n\t" ::"a"(next->thread->fs));
     __asm__ __volatile__("movq	%0,	%%gs \n\t" ::"a"(next->thread->gs));
@@ -561,7 +563,7 @@ ul initial_kernel_thread(ul arg)
     // block_io_scheduler_init();
     ahci_init();
     mount_root_fs();
-    c_virtio_probe();
+    rs_virtio_probe();
     // 使用单独的内核线程来初始化usb驱动程序
     // 注释：由于目前usb驱动程序不完善，因此先将其注释掉
     // int usb_pid = kernel_thread(usb_init, 0, 0);
@@ -577,11 +579,12 @@ ul initial_kernel_thread(ul arg)
     // __test_completion();
 
     // // 对一些组件进行单元测试
-    // uint64_t tpid[] = {
-    //     ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
-    //     ktest_start(ktest_test_idr, 0),
-    //     // usb_pid,
-    // };
+    uint64_t tpid[] = {
+        // ktest_start(ktest_test_bitree, 0), ktest_start(ktest_test_kfifo, 0), ktest_start(ktest_test_mutex, 0),
+        // ktest_start(ktest_test_idr, 0),
+        // usb_pid,
+    };
+
     // kinfo("Waiting test thread exit...");
     // // 等待测试进程退出
     // for (int i = 0; i < sizeof(tpid) / sizeof(uint64_t); ++i)
