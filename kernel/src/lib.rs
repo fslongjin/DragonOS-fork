@@ -31,6 +31,7 @@ mod exception;
 mod filesystem;
 mod io;
 mod ipc;
+mod ktest;
 mod mm;
 mod net;
 mod process;

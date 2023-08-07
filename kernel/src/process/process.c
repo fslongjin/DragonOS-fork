@@ -51,6 +51,8 @@ extern int rs_init_stdio();
 extern uint64_t rs_do_execve(const char *filename, const char *const argv[], const char *const envp[], struct pt_regs *regs);
 extern uint64_t rs_exec_init_process(struct pt_regs *regs);
 
+extern void rs_test_mm_1();
+
 // 设置初始进程的PCB
 #define INITIAL_PROC(proc)                                                                                           \
     {                                                                                                                \
@@ -196,6 +198,9 @@ ul initial_kernel_thread(ul arg)
     io_mfence();
     __rust_demo_func();
     io_mfence();
+
+    // 内存管理测试点1
+    rs_test_mm_1();
 
     // 准备切换到用户态
     struct pt_regs *regs;
