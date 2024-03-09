@@ -36,6 +36,7 @@ use crate::{
 };
 
 use super::{
+    kthread::tty_flush_thread_init,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
@@ -211,7 +212,7 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), buf, size, mode)?;
+            let ret = ld.write(tty.clone(), &buf[written..], size, mode)?;
 
             written += ret;
             count -= ret;
@@ -528,5 +529,7 @@ pub fn tty_init() -> Result<(), SystemError> {
     devfs_register(console.name, console)?;
 
     serial_init()?;
+
+    tty_flush_thread_init();
     return vty_init();
 }
