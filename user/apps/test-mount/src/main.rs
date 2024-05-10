@@ -12,7 +12,7 @@ fn main() {
     let clock = time::Instant::now();
     let source = b"\0".as_ptr() as *const c_char;
     let target = b"/mnt/tmp\0".as_ptr() as *const c_char;
-    let fstype = b"ramfs\0".as_ptr() as *const c_char;
+    let fstype = b"myramfs\0".as_ptr() as *const c_char;
     let flags = MS_BIND;
     let data = std::ptr::null() as *const c_void;
     let result = unsafe { mount(source, target, fstype, flags, data) };

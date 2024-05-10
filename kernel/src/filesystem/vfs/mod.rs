@@ -778,6 +778,7 @@ bitflags! {
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
+        const MYRAMFS_MAGIC = 0x114514;
         const MOUNT_MAGIC = 61267;
     }
 }
