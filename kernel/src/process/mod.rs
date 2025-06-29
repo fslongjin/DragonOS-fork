@@ -73,6 +73,7 @@ use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
 use crate::process::namespace::nsproxy::NsProxy;
+use crate::process::pid::{PidType, PidLink};
 
 pub mod abi;
 pub mod cred;
@@ -761,6 +762,9 @@ pub struct ProcessControlBlock {
 
     /// 进程的可执行文件路径
     executable_path: RwLock<String>,
+
+    /// PID链接数组
+    pids: [PidLink; PidType::PIDTYPE_MAX],
 }
 
 impl ProcessControlBlock {
@@ -863,6 +867,7 @@ impl ProcessControlBlock {
                 restart_block: SpinLock::new(None),
                 process_group: Mutex::new(Weak::new()),
                 executable_path: RwLock::new(name),
+                pids: core::array::from_fn(|_| PidLink::default()),
             };
 
             pcb.sig_info.write().set_tty(tty);
@@ -1262,6 +1267,28 @@ impl ProcessControlBlock {
     /// 设置进程的namespace代理
     pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
         *self.nsproxy.write() = nsproxy;
+    }
+
+    /// 初始化进程的PID链接（仅在fork/exec时调用）
+    pub fn init_pid_links(&mut self, main_pid: Arc<crate::process::pid::Pid>) {
+        // PID 和 TGID 通常相同
+        self.pids[PidType::PID as usize].link_pid(main_pid.clone());
+        self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
+    }
+
+    /// 清理进程的PID链接，在进程退出时调用
+    pub fn clear_pid_links(&mut self) {
+        for link in &mut self.pids {
+            link.unlink_pid();
+        }
+    }
+
+    /// 获取指定类型的PID（若不存在则返回0）
+    pub fn pid_nr_type(&self, ty: PidType) -> i32 {
+        self.pids[ty as usize]
+            .get_pid()
+            .map(|p| p.pid_nr_current())
+            .unwrap_or(0)
     }
 }
 
