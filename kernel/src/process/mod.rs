@@ -73,7 +73,9 @@ use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
 use crate::process::namespace::nsproxy::NsProxy;
-use crate::process::pid::{PidType, PidLink};
+use crate::process::namespace::pid_namespace::{alloc_pid_for_task, free_pid};
+use crate::process::pid::Pid;
+use crate::process::pid::{PidLink, PidType};
 
 pub mod abi;
 pub mod cred;
@@ -803,9 +805,16 @@ impl ProcessControlBlock {
 
     #[inline(never)]
     fn do_create_pcb(name: String, kstack: KernelStack, is_idle: bool) -> Arc<Self> {
-        let (pid, ppid, cwd, cred, tty) = if is_idle {
+        let (pid, ppid, cwd, cred, tty, main_pid_opt): (
+            RawPid,
+            RawPid,
+            String,
+            Cred,
+            Option<Arc<TtyCore>>,
+            Option<Arc<Pid>>,
+        ) = if is_idle {
             let cred = INIT_CRED.clone();
-            (RawPid(0), RawPid(0), "/".to_string(), cred, None)
+            (RawPid(0), RawPid(0), "/".to_string(), cred, None, None)
         } else {
             let ppid = ProcessManager::current_pcb().pid();
             let mut cred = ProcessManager::current_pcb().cred();
@@ -813,7 +822,24 @@ impl ProcessControlBlock {
             cred.cap_effective = cred.cap_ambient;
             let cwd = ProcessManager::current_pcb().basic().cwd();
             let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
-            (Self::generate_pid(), ppid, cwd, cred, tty)
+            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
+            let parent_ns = ProcessManager::current_pcb()
+                .nsproxy()
+                .pid_namespace_for_children()
+                .clone();
+
+            let main_pid_arc = alloc_pid_for_task(&parent_ns).expect("alloc_pid_for_task failed");
+
+            // 根namespace中的PID号作为RawPid
+            let root_pid_nr = main_pid_arc
+                .get_upids()
+                .first()
+                .expect("UPid list empty")
+                .nr as usize;
+
+            let raw_pid = RawPid(root_pid_nr);
+
+            (raw_pid, ppid, cwd, cred, tty, Some(main_pid_arc))
         };
 
         let basic_info = ProcessBasicInfo::new(ppid, name.clone(), cwd, None);
@@ -827,7 +853,7 @@ impl ProcessControlBlock {
             .unwrap_or_default();
 
         // 使用 Arc::new_cyclic 避免在栈上创建巨大的结构体
-        let pcb = Arc::new_cyclic(|weak| {
+        let mut pcb = Arc::new_cyclic(|weak| {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
             // 初始化namespace代理
@@ -926,6 +952,17 @@ impl ProcessControlBlock {
         //     pcb.process_group().unwrap().pgid(),
         //     pcb.session().unwrap().sid()
         // );
+
+        // 初始化PID链接（仅非idle分支需要）
+        if let Some(main_pid_arc) = main_pid_opt {
+            // 安全获取可变引用，因为此时只有一个Arc强引用
+            if let Some(pcb_mut) = Arc::get_mut(&mut pcb) {
+                pcb_mut.init_pid_links(main_pid_arc.clone());
+            }
+
+            // 将当前pcb添加到PID结构体的任务列表
+            main_pid_arc.attach_task(Arc::downgrade(&pcb), PidType::PID);
+        }
 
         return pcb;
     }
@@ -1279,6 +1316,9 @@ impl ProcessControlBlock {
     /// 清理进程的PID链接，在进程退出时调用
     pub fn clear_pid_links(&mut self) {
         for link in &mut self.pids {
+            if let Some(pid_arc) = link.get_pid() {
+                free_pid(pid_arc);
+            }
             link.unlink_pid();
         }
     }
@@ -1298,7 +1338,8 @@ impl Drop for ProcessControlBlock {
         // 在ProcFS中,解除进程的注册
         procfs_unregister_pid(self.pid())
             .unwrap_or_else(|e| panic!("procfs_unregister_pid failed: error: {e:?}"));
-
+        // 释放所有 PID 映射
+        self.clear_pid_links();
         if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
             ppcb.children
                 .write_irqsave()
