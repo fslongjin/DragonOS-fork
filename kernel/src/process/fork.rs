@@ -508,6 +508,25 @@ impl ProcessManager {
                 .store(clone_args.exit_signal, Ordering::SeqCst);
         }
 
+        // 在TGID设置完成后，重新初始化完整的PID链接
+        // 这确保线程能正确共享父进程的TGID，并建立正确的PGID和SID链接
+        if let Some(main_pid_arc) = pcb.pids[crate::process::pid::PidType::PID as usize].get_pid() {
+            unsafe {
+                let pcb_ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                // 先清理现有的链接（除了PID链接）
+                (*pcb_ptr).pids[crate::process::pid::PidType::TGID as usize].unlink_pid();
+                (*pcb_ptr).pids[crate::process::pid::PidType::PGID as usize].unlink_pid();
+                (*pcb_ptr).pids[crate::process::pid::PidType::SID as usize].unlink_pid();
+                
+                // 重新初始化所有PID链接，此时TGID已经正确设置
+                (*pcb_ptr).init_pid_links(main_pid_arc.clone());
+            }
+        } else {
+            // 如果没有主PID，这表示进程创建有问题
+            // 这种情况通常不应该发生，因为do_create_pcb应该已经为非idle进程分配了PID
+            panic!("fork: No main PID found for process {:?}, parent: {:?}", pcb.pid(), current_pcb.pid());
+        }
+
         // todo: 增加线程组相关的逻辑。 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/fork.c#2437
 
         Self::copy_group(current_pcb, pcb).unwrap_or_else(|e| {

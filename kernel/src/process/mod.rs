@@ -490,6 +490,16 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
             pcb.clear_pg_and_session_reference();
+
+            // 清理PID链接，从PID结构体的任务列表中移除当前进程
+            // 这必须在进程退出的最后阶段执行，确保所有其他清理工作都已完成
+            unsafe {
+                // 由于我们在exit函数中，需要获取可变引用来调用clear_pid_links
+                let pcb_ptr =
+                    pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                (*pcb_ptr).clear_pid_links();
+            }
+
             drop(pcb);
             ProcessManager::exit_notify();
         }
@@ -828,7 +838,12 @@ impl ProcessControlBlock {
                 .pid_namespace_for_children()
                 .clone();
 
-            let main_pid_arc = alloc_pid_for_task(&parent_ns).expect("alloc_pid_for_task failed");
+            let main_pid_arc = alloc_pid_for_task(&parent_ns).unwrap_or_else(|e| {
+                panic!(
+                    "alloc_pid_for_task failed for parent pid={:?}, error={:?}",
+                    ppid, e
+                );
+            });
 
             // 根namespace中的PID号作为RawPid
             let root_pid_nr = main_pid_arc
@@ -953,15 +968,18 @@ impl ProcessControlBlock {
         //     pcb.session().unwrap().sid()
         // );
 
-        // 初始化PID链接（仅非idle分支需要）
+        // 为非idle进程设置基本的PID链接
         if let Some(main_pid_arc) = main_pid_opt {
-            // 安全获取可变引用，因为此时只有一个Arc强引用
-            if let Some(pcb_mut) = Arc::get_mut(&mut pcb) {
-                pcb_mut.init_pid_links(main_pid_arc.clone());
+            // 先设置基本的PID链接，这样fork流程可以访问到main_pid
+            // 注意：由于在Arc::new_cyclic内部已经有多个引用，Arc::get_mut会失败
+            // 所以我们使用unsafe方式来设置链接
+            unsafe {
+                let pcb_ptr =
+                    pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
+                (*pcb_ptr).pids[PidType::PID as usize].link_pid(main_pid_arc.clone());
+                // 注意：完整的PID链接初始化将在copy_process中进行
+                // 这样可以确保线程的TGID在调用init_pid_links之前已经正确设置
             }
-
-            // 将当前pcb添加到PID结构体的任务列表
-            main_pid_arc.attach_task(Arc::downgrade(&pcb), PidType::PID);
         }
 
         return pcb;
@@ -1308,17 +1326,101 @@ impl ProcessControlBlock {
 
     /// 初始化进程的PID链接（仅在fork/exec时调用）
     pub fn init_pid_links(&mut self, main_pid: Arc<crate::process::pid::Pid>) {
-        // PID 和 TGID 通常相同
+        // 设置进程PID
         self.pids[PidType::PID as usize].link_pid(main_pid.clone());
-        self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
+        // 将当前进程添加到PID任务列表
+        main_pid.attach_task(self.self_ref.clone(), PidType::PID);
+
+        // 设置线程组ID（通常与进程PID相同，除非是线程）
+        // 如果当前进程的tgid与pid不同，说明这是一个线程，需要使用父进程的TGID
+        if self.tgid != self.pid {
+            // 这是一个线程，需要找到线程组领导者的PID结构体
+            if let Some(parent) = self.parent_pcb.read().upgrade() {
+                if let Some(tgid_link) = &parent.pids[PidType::TGID as usize].pid {
+                    self.pids[PidType::TGID as usize].link_pid(tgid_link.clone());
+                    tgid_link.attach_task(self.self_ref.clone(), PidType::TGID);
+                } else {
+                    // 如果父进程没有TGID链接，使用main_pid
+                    self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
+                    main_pid.attach_task(self.self_ref.clone(), PidType::TGID);
+                }
+            } else {
+                // 没有父进程，使用自己的PID作为TGID
+                self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
+                main_pid.attach_task(self.self_ref.clone(), PidType::TGID);
+            }
+        } else {
+            // 这是一个普通进程，TGID与PID相同
+            self.pids[PidType::TGID as usize].link_pid(main_pid.clone());
+            main_pid.attach_task(self.self_ref.clone(), PidType::TGID);
+        }
+
+        // 继承父进程的进程组ID和会话ID
+        if let Some(parent) = self.parent_pcb.read().upgrade() {
+            // 继承进程组ID
+            if let Some(pgid_link) = &parent.pids[PidType::PGID as usize].pid {
+                self.pids[PidType::PGID as usize].link_pid(pgid_link.clone());
+                // 将当前进程添加到进程组的任务列表
+                pgid_link.attach_task(self.self_ref.clone(), PidType::PGID);
+            } else {
+                // 如果父进程没有进程组ID，使用自己的PID作为进程组ID
+                self.pids[PidType::PGID as usize].link_pid(main_pid.clone());
+                main_pid.attach_task(self.self_ref.clone(), PidType::PGID);
+            }
+
+            // 继承会话ID
+            if let Some(sid_link) = &parent.pids[PidType::SID as usize].pid {
+                self.pids[PidType::SID as usize].link_pid(sid_link.clone());
+                // 将当前进程添加到会话的任务列表
+                sid_link.attach_task(self.self_ref.clone(), PidType::SID);
+            } else {
+                // 如果父进程没有会话ID，使用自己的PID作为会话ID
+                self.pids[PidType::SID as usize].link_pid(main_pid.clone());
+                main_pid.attach_task(self.self_ref.clone(), PidType::SID);
+            }
+        } else {
+            // 没有父进程的情况（如init进程），自己就是进程组和会话的领导者
+            self.pids[PidType::PGID as usize].link_pid(main_pid.clone());
+            self.pids[PidType::SID as usize].link_pid(main_pid.clone());
+            main_pid.attach_task(self.self_ref.clone(), PidType::PGID);
+            main_pid.attach_task(self.self_ref.clone(), PidType::SID);
+        }
     }
 
     /// 清理进程的PID链接，在进程退出时调用
     pub fn clear_pid_links(&mut self) {
-        for link in &mut self.pids {
-            if let Some(pid_arc) = link.get_pid() {
-                free_pid(pid_arc);
+        // 获取当前进程的强引用，用于从PID任务列表中移除
+        let self_arc = match self.self_ref.upgrade() {
+            Some(arc) => arc,
+            None => {
+                // 如果无法获取强引用，说明进程正在被销毁，直接清理链接即可
+                for link in &mut self.pids {
+                    link.unlink_pid();
+                }
+                return;
             }
+        };
+
+        // 遍历所有PID类型，从对应的任务列表中移除当前进程
+        for (i, link) in self.pids.iter_mut().enumerate() {
+            if let Some(pid_arc) = link.get_pid() {
+                let pid_type = match i {
+                    0 => PidType::PID,
+                    1 => PidType::TGID,
+                    2 => PidType::PGID,
+                    3 => PidType::SID,
+                    _ => continue,
+                };
+
+                // 从PID的任务列表中移除当前进程
+                pid_arc.detach_task(self_arc.clone(), pid_type);
+
+                // 如果这是进程的主PID（PID类型），则释放PID资源
+                if pid_type == PidType::PID {
+                    free_pid(pid_arc);
+                }
+            }
+            // 清理链接
             link.unlink_pid();
         }
     }
