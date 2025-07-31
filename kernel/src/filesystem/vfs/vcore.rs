@@ -64,6 +64,10 @@ pub fn vfs_init() -> Result<(), SystemError> {
         __ROOT_INODE = Some(root_inode.clone());
     }
 
+    // 初始化mount namespace并建立与根MountFS的关联
+    // 这必须在ROOT_INODE设置后进行，以避免循环依赖
+    super::vfs_early_init::vfs_mount_namespace_init(mount_fs)?;
+
     procfs_init().expect("Failed to initialize procfs");
 
     devfs_init().expect("Failed to initialize devfs");
@@ -112,6 +116,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         __ROOT_INODE = Some(new_root_inode.clone());
         drop(old_root_inode);
     }
+
+    // 更新mount namespace的根MountFS
+    super::vfs_early_init::update_mount_namespace_root(new_fs);
 
     info!("VFS: Migrate filesystems done!");
 

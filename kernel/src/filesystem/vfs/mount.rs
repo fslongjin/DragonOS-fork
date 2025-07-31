@@ -45,6 +45,14 @@ pub struct MountFS {
     self_mountpoint: Option<Arc<MountFSInode>>,
     /// 指向当前MountFS的弱引用
     self_ref: Weak<MountFS>,
+
+    /// === 新增字段：namespace支持 ===
+    /// 所属的mount namespace（使用RwLock提供内部可变性）
+    namespace: RwLock<Weak<crate::process::namespace::mount_namespace::MountNamespace>>,
+    /// propagation信息
+    propagation: RwLock<crate::process::namespace::mount_namespace::MountPropagation>,
+    /// 挂载ID（用于内核调试和/proc输出）
+    mount_id: u32,
 }
 
 /// @brief MountFS的Index Node 注意，这个IndexNode只是一个中间层。它的目的是将具体文件系统的Inode与挂载机制连接在一起。
@@ -60,16 +68,40 @@ pub struct MountFSInode {
 }
 
 impl MountFS {
-    pub fn new(
+    /// 新的构造函数，支持namespace
+    pub fn new_with_namespace(
         inner_filesystem: Arc<dyn FileSystem>,
         self_mountpoint: Option<Arc<MountFSInode>>,
+        namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
+        propagation: crate::process::namespace::mount_namespace::MountPropagation,
+        mount_id: u32,
     ) -> Arc<Self> {
-        return Arc::new_cyclic(|self_ref| MountFS {
+        Arc::new_cyclic(|self_ref| MountFS {
             inner_filesystem,
             mountpoints: SpinLock::new(BTreeMap::new()),
             self_mountpoint,
             self_ref: self_ref.clone(),
-        });
+            namespace: RwLock::new(namespace),
+            propagation: RwLock::new(propagation),
+            mount_id,
+        })
+    }
+
+    /// 保持向后兼容的构造函数（启动时使用，不依赖namespace）
+    pub fn new(
+        inner_filesystem: Arc<dyn FileSystem>,
+        self_mountpoint: Option<Arc<MountFSInode>>,
+    ) -> Arc<Self> {
+        use crate::process::namespace::mount_namespace::MountPropagation;
+
+        // 启动时的简化版本，不依赖mount namespace避免循环依赖
+        Self::new_with_namespace(
+            inner_filesystem,
+            self_mountpoint,
+            Weak::new(), // 空的namespace引用
+            MountPropagation::new_private(),
+            0, // 默认mount_id
+        )
     }
 
     /// @brief 用Arc指针包裹MountFS对象。
@@ -109,6 +141,117 @@ impl MountFS {
         self.self_ref.upgrade().unwrap()
     }
 
+    /// 为新的mount namespace深度复制当前MountFS
+    /// 创建一个新的MountFS实例，具有相同的内部文件系统但独立的挂载点管理
+    pub fn deep_copy_for_namespace(
+        &self,
+        new_namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
+        mount_id: u32,
+    ) -> Arc<Self> {
+        // 创建新的MountFS，使用相同的内部文件系统但独立的mountpoints
+        let new_mount_fs = Self::new_with_namespace(
+            self.inner_filesystem.clone(),
+            None, // 在新namespace中，这个MountFS没有父挂载点引用
+            new_namespace.clone(),
+            crate::process::namespace::mount_namespace::MountPropagation::new_private(),
+            mount_id,
+        );
+
+        // 递归复制所有子挂载点
+        let source_mountpoints = self.mountpoints.lock();
+        let mut new_mountpoints = new_mount_fs.mountpoints.lock();
+
+        for (inode_id, child_mount_fs) in source_mountpoints.iter() {
+            // 递归复制子挂载点，为每个子挂载点分配新的全局mount ID
+            let new_child = child_mount_fs.deep_copy_for_namespace(
+                new_namespace.clone(),
+                crate::process::namespace::mount_namespace::alloc_global_mount_id(), // 分配新的全局mount ID
+            );
+            new_mountpoints.insert(*inode_id, new_child);
+        }
+
+        drop(new_mountpoints);
+        drop(source_mountpoints);
+
+        new_mount_fs
+    }
+
+    /// 获取挂载ID
+    pub fn mount_id(&self) -> u32 {
+        self.mount_id
+    }
+
+    /// 获取所属的namespace
+    pub fn namespace(
+        &self,
+    ) -> Option<Arc<crate::process::namespace::mount_namespace::MountNamespace>> {
+        self.namespace.read().upgrade()
+    }
+
+    /// 设置namespace引用（用于创建时的循环引用设置）
+    pub fn set_namespace(
+        &self,
+        namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
+    ) {
+        let mut ns_guard = self.namespace.write();
+        // 为了安全起见，我们只在特定条件下允许这种操作
+        // 比如当前namespace为空时（即初始化阶段）
+        if ns_guard.upgrade().is_none() {
+            *ns_guard = namespace;
+            log::info!(
+                "set_namespace: successfully set namespace for mount_fs id: {}",
+                self.mount_id
+            );
+        } else {
+            log::warn!(
+                "set_namespace: attempted to change existing namespace for mount_fs id: {}",
+                self.mount_id
+            );
+            log::warn!("Attempting to set namespace on existing MountFS - consider using new_with_namespace instead");
+        }
+    }
+
+    /// 设置propagation类型
+    pub fn set_propagation(
+        &self,
+        prop_type: crate::process::namespace::mount_namespace::PropagationType,
+    ) -> Result<(), SystemError> {
+        use crate::process::namespace::mount_namespace::PropagationType;
+
+        let mut prop = self.propagation.write();
+
+        match prop_type {
+            PropagationType::Shared => {
+                // 加入或创建共享组
+                let ns = self.namespace.read().upgrade();
+                if let Some(ns) = ns {
+                    let group_id = ns.create_or_join_shared_group(self.self_ref.clone())?;
+                    prop.shared_group_id = Some(group_id);
+                }
+            }
+            PropagationType::Private => {
+                // 退出共享组
+                if let Some(group_id) = prop.shared_group_id.take() {
+                    let ns = self.namespace.read().upgrade();
+                    if let Some(ns) = ns {
+                        ns.leave_shared_group(group_id, &self.self_ref)?;
+                    }
+                }
+            }
+            _ => {
+                // 其他类型的处理
+            }
+        }
+
+        prop.prop_type = prop_type;
+        Ok(())
+    }
+
+    /// 获取propagation信息
+    pub fn propagation(&self) -> crate::process::namespace::mount_namespace::PropagationType {
+        self.propagation.read().prop_type
+    }
+
     /// 卸载文件系统
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
@@ -121,6 +264,73 @@ impl MountFS {
 }
 
 impl MountFSInode {
+    /// 获取对应的MountFS
+    pub fn mount_fs(&self) -> Arc<MountFS> {
+        self.mount_fs.clone()
+    }
+
+    /// 在指定的mount namespace中找到包含当前inode的MountFS
+    /// 通过路径解析来找到正确的MountFS
+    fn find_namespace_mountfs(
+        &self,
+        mount_ns: &Arc<crate::process::namespace::mount_namespace::MountNamespace>,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        // 获取当前inode的绝对路径
+        let target_path = self.absolute_path()?;
+        log::info!("find_namespace_mountfs: target_path = {:?}", target_path);
+
+        // 从namespace的root开始，沿路径查找包含此inode的MountFS
+        let root_mountfs = mount_ns.root_mountfs();
+
+        // 这里我们需要实现路径解析逻辑
+        // 但是考虑到DragonOS当前的架构，最直接的方法是：
+        // 1. 如果当前inode就在root文件系统上，返回root MountFS
+        // 2. 否则，查找mount list中是否有匹配的挂载点
+
+        let mount_list = mount_ns.mount_list();
+        let mount_map = mount_list.0.read();
+
+        // 检查是否有挂载点包含或等于当前路径
+        let mut best_match: Option<Arc<MountFS>> = None;
+        let mut best_match_len = 0;
+
+        for (mount_path, mount_fs) in mount_map.iter() {
+            let mount_path_str = mount_path.to_string();
+            log::info!(
+                "find_namespace_mountfs: checking mount_path = {}",
+                mount_path_str
+            );
+
+            // 检查当前路径是否以mount_path开头（即在这个挂载点下）
+            if target_path.as_str().starts_with(&mount_path_str) {
+                // 找到更长的匹配（更具体的挂载点）
+                if mount_path_str.len() > best_match_len {
+                    best_match = Some(mount_fs.clone());
+                    best_match_len = mount_path_str.len();
+                    log::info!(
+                        "find_namespace_mountfs: found better match: {} (len={})",
+                        mount_path_str,
+                        best_match_len
+                    );
+                }
+            }
+        }
+
+        // 如果找到了更具体的挂载点，使用它；否则使用root
+        if let Some(mount_fs) = best_match {
+            log::info!(
+                "find_namespace_mountfs: using best match mount_fs id: {}",
+                mount_fs.mount_id()
+            );
+            Ok(mount_fs)
+        } else {
+            log::info!(
+                "find_namespace_mountfs: using root mount_fs id: {}",
+                root_mountfs.mount_id()
+            );
+            Ok(root_mountfs)
+        }
+    }
     /// @brief 用Arc指针包裹MountFSInode对象。
     /// 本函数的主要功能为，初始化MountFSInode对象中的自引用Weak指针
     /// 本函数只应在构造器中被调用
@@ -154,15 +364,97 @@ impl MountFSInode {
     /// 如果当前inode是父MountFS内的一个挂载点，那么，本函数将会返回挂载到这个挂载点下的文件系统的root inode.
     /// 如果当前inode在父MountFS内，但不是挂载点，那么说明在这里不需要进行inode替换，因此直接返回当前inode。
     ///
+    /// 现在支持mount namespace感知
+    ///
     /// @return Arc<MountFSInode>
     fn overlaid_inode(&self) -> Arc<MountFSInode> {
         let inode_id = self.metadata().unwrap().inode_id;
 
-        if let Some(sub_mountfs) = self.mount_fs.mountpoints.lock().get(&inode_id) {
-            return sub_mountfs.mountpoint_root_inode();
+        // Namespace感知的MountFS查找逻辑
+        let target_mount_fs = if crate::process::ProcessManager::initialized() {
+            let current_pcb = crate::process::ProcessManager::current_pcb();
+            let mount_ns = current_pcb.nsproxy().mount_ns.clone();
+
+            // 检查当前mount_fs是否属于当前namespace
+            if let Some(current_ns) = self.mount_fs.namespace() {
+                if Arc::ptr_eq(&current_ns, &mount_ns) {
+                    // 当前mount_fs属于当前namespace，直接使用
+                    log::info!(
+                        "overlaid_inode: mount_fs id {} belongs to current namespace",
+                        self.mount_fs.mount_id()
+                    );
+                    self.mount_fs.clone()
+                } else {
+                    // mount_fs属于其他namespace，需要找到当前namespace中对应的MountFS
+                    log::info!("overlaid_inode: mount_fs id {} belongs to different namespace, finding corresponding one", self.mount_fs.mount_id());
+                    self.find_corresponding_mountfs_in_namespace(&mount_ns)
+                }
+            } else {
+                // mount_fs没有namespace，可能是旧的实例，使用当前namespace的root
+                log::info!(
+                    "overlaid_inode: mount_fs has no namespace, using current namespace root"
+                );
+                mount_ns.root_mountfs()
+            }
         } else {
+            // 进程管理未初始化，使用原来的逻辑
+            self.mount_fs.clone()
+        };
+
+        // 检查mountpoints
+        let mountpoints = target_mount_fs.mountpoints.lock();
+        if let Some(sub_mountfs) = mountpoints.get(&inode_id) {
+            log::info!(
+                "overlaid_inode: found mountpoint for inode_id {:?}, jumping to mount_fs id: {}",
+                inode_id,
+                sub_mountfs.mount_id()
+            );
+            let result = sub_mountfs.mountpoint_root_inode();
+            drop(mountpoints);
+            return result;
+        } else {
+            log::info!(
+                "overlaid_inode: no mountpoint found for inode_id {:?}, using self",
+                inode_id
+            );
+            drop(mountpoints);
             return self.self_ref.upgrade().unwrap();
         }
+    }
+
+    /// 在指定namespace中找到与当前mount_fs对应的MountFS实例
+    fn find_corresponding_mountfs_in_namespace(
+        &self,
+        mount_ns: &Arc<crate::process::namespace::mount_namespace::MountNamespace>,
+    ) -> Arc<MountFS> {
+        let current_mount_id = self.mount_fs.mount_id();
+
+        // 首先检查是否是root文件系统
+        let ns_root = mount_ns.root_mountfs();
+        if current_mount_id == 0 || ns_root.mount_id() == current_mount_id {
+            log::info!(
+                "find_corresponding_mountfs: using namespace root mount_fs id: {}",
+                ns_root.mount_id()
+            );
+            return ns_root;
+        }
+
+        // 检查mount list中是否有相同mount_id的MountFS
+        let mount_list = mount_ns.mount_list();
+        let mount_map = mount_list.0.read();
+        for (_, mount_fs) in mount_map.iter() {
+            if mount_fs.mount_id() == current_mount_id {
+                log::info!(
+                    "find_corresponding_mountfs: found matching mount_fs id: {}",
+                    current_mount_id
+                );
+                return mount_fs.clone();
+            }
+        }
+
+        // 如果找不到匹配的，使用namespace的root
+        log::warn!("find_corresponding_mountfs: no matching mount_fs found, using namespace root");
+        ns_root
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
@@ -459,15 +751,94 @@ impl IndexNode for MountFSInode {
             .downcast_arc::<MountFS>()
             .map(|it| it.inner_filesystem())
             .unwrap_or(fs);
-        let new_mount_fs = MountFS::new(to_mount_fs, Some(self.self_ref.upgrade().unwrap()));
-        self.mount_fs
+
+        // 获取当前进程的mount namespace并创建namespace感知的MountFS
+        let new_mount_fs = {
+            use crate::process::namespace::mount_namespace::MountPropagation;
+            use crate::process::ProcessManager;
+
+            if ProcessManager::initialized() {
+                // 进程管理已初始化，使用当前进程的mount namespace
+                let current_pcb = ProcessManager::current_pcb();
+                let mount_ns = current_pcb.nsproxy().mount_ns.clone();
+                let mount_id = crate::process::namespace::mount_namespace::alloc_global_mount_id();
+                let namespace_ref = Arc::downgrade(&mount_ns);
+
+                log::info!(
+                    "Mounting filesystem, target: {:?}, mount_id: {}",
+                    self.absolute_path(),
+                    mount_id
+                );
+
+                MountFS::new_with_namespace(
+                    to_mount_fs,
+                    Some(self.self_ref.upgrade().unwrap()),
+                    namespace_ref,
+                    MountPropagation::new_private(),
+                    mount_id,
+                )
+            } else {
+                // 进程管理未初始化，但我们仍然要创建namespace-aware的MountFS
+                // 使用root mount namespace
+                let mount_id = crate::process::namespace::mount_namespace::alloc_global_mount_id();
+                let root_mount_ns = crate::process::namespace::mount_namespace::init_mount_namespace();
+                let namespace_ref = Arc::downgrade(&root_mount_ns);
+
+                log::info!(
+                    "Mounting filesystem (early boot), target: {:?}, mount_id: {}",
+                    self.absolute_path(),
+                    mount_id
+                );
+
+                MountFS::new_with_namespace(
+                    to_mount_fs,
+                    Some(self.self_ref.upgrade().unwrap()),
+                    namespace_ref,
+                    MountPropagation::new_private(),
+                    mount_id,
+                )
+            }
+        };
+
+        // 关键修复：使用当前进程的namespace的root MountFS，而不是self.mount_fs
+        let target_mount_fs = if crate::process::ProcessManager::initialized() {
+            let current_pcb = crate::process::ProcessManager::current_pcb();
+            let mount_ns = current_pcb.nsproxy().mount_ns.clone();
+
+            log::info!(
+                "Mount: current namespace id: {}, self.mount_fs id: {}",
+                mount_ns.root_mountfs().mount_id(),
+                self.mount_fs.mount_id()
+            );
+
+            // 找到当前namespace中对应的MountFS
+            // 我们需要从当前namespace的root开始，找到包含这个inode的MountFS
+            let target = self.find_namespace_mountfs(&mount_ns)?;
+            log::info!("Mount: target_mount_fs id: {}", target.mount_id());
+            target
+        } else {
+            self.mount_fs.clone()
+        };
+
+        log::info!(
+            "Mount: inserting into mountpoints, inode_id: {:?}, new_mount_fs id: {}",
+            metadata.inode_id,
+            new_mount_fs.mount_id()
+        );
+
+        target_mount_fs
             .mountpoints
             .lock()
             .insert(metadata.inode_id, new_mount_fs.clone());
 
-        let mount_path = self.absolute_path();
+        let mount_path = self.absolute_path()?;
 
-        MOUNT_LIST().insert(mount_path?, new_mount_fs.clone());
+        // 处理mount propagation
+        if let Some(namespace) = target_mount_fs.namespace() {
+            namespace.handle_mount_propagation(&target_mount_fs, &mount_path, &new_mount_fs)?;
+        }
+
+        MOUNT_LIST().insert(mount_path.clone(), new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 
@@ -495,6 +866,14 @@ impl IndexNode for MountFSInode {
         if !self.is_mountpoint_root()? {
             return Err(SystemError::EINVAL);
         }
+
+        let mount_path = self.absolute_path()?;
+
+        // 处理umount propagation
+        if let Some(namespace) = self.mount_fs.namespace() {
+            namespace.handle_umount_propagation(&self.mount_fs, &mount_path)?;
+        }
+
         return self.mount_fs.umount();
     }
 
@@ -597,7 +976,7 @@ impl FileSystem for MountFS {
 /// assert_eq!(format!("{:?}", map), "{\"/\", \"/bin\", \"/dev\", \"/proc\", \"/sys\"}");
 /// // {"/", "/bin", "/dev", "/proc", "/sys"}
 /// ```
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct MountPath(String);
 
 impl From<&str> for MountPath {
@@ -615,6 +994,12 @@ impl From<String> for MountPath {
 impl AsRef<str> for MountPath {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+impl core::fmt::Display for MountPath {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -662,21 +1047,75 @@ pub fn init_mountlist() {
     }
 }
 
-/// # MOUNT_LIST - 获取全局挂载列表
+/// # MOUNT_LIST - 获取挂载列表
 ///
-/// 该函数用于获取一个对全局挂载列表的引用。全局挂载列表是系统中所有挂载点的集合。
+/// 该函数用于获取挂载列表引用。在进程管理初始化之前，返回全局挂载列表；
+/// 初始化之后，返回当前进程mount namespace的挂载列表。
+///
+/// ## 返回值
+/// - Arc<MountList>: 返回挂载列表的引用。
+#[inline(always)]
+#[allow(non_snake_case)]
+pub fn MOUNT_LIST() -> Arc<MountList> {
+    use crate::process::ProcessManager;
+
+    // 检查进程管理是否已经初始化
+    if !ProcessManager::initialized() {
+        // 进程管理未初始化，使用全局挂载列表
+        return GLOBAL_MOUNT_LIST().clone();
+    }
+
+    // 进程管理已初始化，获取当前进程的mount namespace
+    let current_pcb = ProcessManager::current_pcb();
+    let mount_ns = current_pcb.nsproxy().mount_ns.clone();
+    mount_ns.mount_list()
+}
+
+/// # GLOBAL_MOUNT_LIST - 获取全局挂载列表（为了向后兼容）
+///
+/// 该函数用于获取全局挂载列表的引用。主要用于系统初始化和兼容性目的。
 ///
 /// ## 返回值
 /// - &'static Arc<MountList>: 返回全局挂载列表的引用。
 #[inline(always)]
 #[allow(non_snake_case)]
-pub fn MOUNT_LIST() -> &'static Arc<MountList> {
+pub fn GLOBAL_MOUNT_LIST() -> &'static Arc<MountList> {
     unsafe {
         return __MOUNTS_LIST.as_ref().unwrap();
     }
 }
 
 impl MountList {
+    /// 创建一个新的空挂载列表
+    pub fn new_empty() -> Self {
+        use crate::libs::rwlock::RwLock;
+        use alloc::collections::BTreeMap;
+
+        Self(RwLock::new(BTreeMap::new()))
+    }
+
+    /// 复制挂载列表内容到另一个挂载列表
+    /// 用于namespace复制
+    pub fn copy_to(
+        &self,
+        target: &MountList,
+        new_namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
+    ) -> Result<(), SystemError> {
+        let source_map = self.0.read();
+        let mut target_map = target.0.write();
+
+        // 为每个挂载点创建新的MountFS实例，确保隔离
+        for (path, mount_fs) in source_map.iter() {
+            let new_mount_fs = mount_fs.deep_copy_for_namespace(
+                new_namespace.clone(),
+                mount_fs.mount_id(), // 保持相同的mount_id用于识别
+            );
+            target_map.insert(path.clone(), new_mount_fs);
+        }
+
+        Ok(())
+    }
+
     /// # insert - 将文件系统挂载点插入到挂载表中
     ///
     /// 将一个新的文件系统挂载点插入到挂载表中。如果挂载点已经存在，则会更新对应的文件系统。
@@ -749,7 +1188,7 @@ impl MountList {
 
 impl Debug for MountList {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_map().entries(MOUNT_LIST().0.read().iter()).finish()
+        f.debug_map().entries(self.0.read().iter()).finish()
     }
 }
 

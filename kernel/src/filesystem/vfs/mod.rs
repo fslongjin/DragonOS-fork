@@ -2,6 +2,8 @@ pub mod fcntl;
 pub mod file;
 pub mod iov;
 pub mod mount;
+pub mod proc_mounts;
+pub mod vfs_early_init;
 pub mod open;
 pub mod stat;
 pub mod syscall;

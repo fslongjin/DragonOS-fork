@@ -7,7 +7,7 @@ use system_error::SystemError;
 
 use crate::process::ProcessControlBlock;
 
-use super::{fcntl::AtFlags, FileType, IndexNode, ROOT_INODE};
+use super::{fcntl::AtFlags, FileType, IndexNode};
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -42,8 +42,8 @@ pub fn user_path_at(
     dirfd: i32,
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
-    let mut inode = ROOT_INODE();
     let ret_path;
+    
     // 如果path不是绝对路径，则需要拼接
     if path.is_empty() || path.as_bytes()[0] != b'/' {
         // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录
@@ -62,8 +62,9 @@ pub fn user_path_at(
                 return Err(SystemError::ENOTDIR);
             }
 
-            inode = file.inode();
+            let inode = file.inode();
             ret_path = String::from(path);
+            return Ok((inode, ret_path));
         } else {
             let mut cwd = pcb.basic().cwd();
             cwd.push('/');
@@ -74,7 +75,12 @@ pub fn user_path_at(
         ret_path = String::from(path);
     }
 
-    return Ok((inode, ret_path));
+    // 对于绝对路径，使用当前进程的mount namespace根节点
+    let mount_ns = pcb.nsproxy().mount_ns.clone();
+    let root_mountfs = mount_ns.root_mountfs();
+    let inode = root_mountfs.mountpoint_root_inode();
+
+    return Ok((inode as Arc<dyn IndexNode>, ret_path));
 }
 
 /// Directory Name

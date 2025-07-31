@@ -4,7 +4,7 @@ use system_error::SystemError;
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
 use core::{fmt::Debug, intrinsics::likely};
 
-use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+use super::{mount_namespace::MountNamespace, pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -17,8 +17,9 @@ use super::{pid_namespace::PidNamespace, user_namespace::UserNamespace, Namespac
 pub struct NsProxy {
     /// PID namespace（用于子进程）
     pub pid_ns_for_children: Arc<PidNamespace>,
+    /// Mount namespace（挂载命名空间）
+    pub mount_ns: Arc<MountNamespace>,
     // 其他namespace（为未来扩展预留）
-    // pub mount_ns: Option<Arc<MountNamespace>>,
     // pub user_ns: Option<Arc<UserNamespace>>,
     // pub net_ns: Option<Arc<NetNamespace>>,
     // pub ipc_ns: Option<Arc<IpcNamespace>>,
@@ -37,14 +38,21 @@ impl NsProxy {
     /// 创建root namespace代理
     pub fn new_root() -> Arc<Self> {
         let root_pid_ns = super::pid_namespace::INIT_PID_NAMESPACE.clone();
+        let root_mount_ns = super::mount_namespace::init_mount_namespace();
         Arc::new(Self {
             pid_ns_for_children: root_pid_ns,
+            mount_ns: root_mount_ns,
         })
     }
 
     /// 获取子进程的PID namespace
     pub fn pid_namespace_for_children(&self) -> &Arc<PidNamespace> {
         &self.pid_ns_for_children
+    }
+    
+    /// 获取mount namespace
+    pub fn mount_namespace(&self) -> &Arc<MountNamespace> {
+        &self.mount_ns
     }
 }
 
@@ -119,10 +127,16 @@ fn create_new_namespaces(
     let pid_ns_for_children = pcb
         .nsproxy()
         .pid_ns_for_children
-        .copy_pid_ns(clone_flags, user_ns)?;
+        .copy_pid_ns(clone_flags, user_ns.clone())?;
+        
+    let mount_ns = pcb
+        .nsproxy()
+        .mount_ns
+        .copy_mount_ns(clone_flags, user_ns)?;
 
     let result = NsProxy {
         pid_ns_for_children,
+        mount_ns,
     };
 
     let result = Arc::new(result);

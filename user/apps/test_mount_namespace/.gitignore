@@ -1,0 +1,4 @@
+test_mount_namespace
+*.o
+*.a
+.DS_Store

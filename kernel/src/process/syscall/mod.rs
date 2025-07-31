@@ -1,4 +1,5 @@
 mod sys_clone;
+mod sys_unshare;
 mod sys_execve;
 mod sys_execveat;
 mod sys_exit;

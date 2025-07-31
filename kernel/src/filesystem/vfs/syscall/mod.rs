@@ -48,6 +48,7 @@ mod sys_write;
 mod sys_writev;
 
 mod epoll_utils;
+mod sys_mount_propagation;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_create;
 mod sys_epoll_create1;
