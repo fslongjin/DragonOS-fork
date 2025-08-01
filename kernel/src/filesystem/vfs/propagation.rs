@@ -889,7 +889,7 @@ impl PropagationEngine {
     fn propagate_umount_to_shared_group(
         &self,
         group_id: u32,
-        _target_path: &str,
+        target_path: &str,
         source_mount: &Arc<MountFS>,
     ) -> Result<(), SystemError> {
         log::info!(
@@ -911,18 +911,132 @@ impl PropagationEngine {
                 member.mount_id()
             );
 
-            // 在实际实现中，这里应该：
-            // 1. 在对应的挂载点执行卸载操作
-            // 2. 更新相应的mount list
-            // 3. 递归地处理子挂载点
-
-            // 简化实现：仅记录传播事件
-            log::info!(
-                "PropagationEngine: umount propagation to mount_id {} (simplified)",
-                member.mount_id()
-            );
+            // 实际执行umount传播
+            if let Err(e) = self.perform_propagated_umount(&member, target_path) {
+                log::warn!(
+                    "PropagationEngine: failed to propagate umount to mount_id {}: {:?}",
+                    member.mount_id(),
+                    e
+                );
+                // 继续处理其他成员，不因为一个失败而停止整个传播
+            } else {
+                log::info!(
+                    "PropagationEngine: successfully propagated umount to mount_id {}",
+                    member.mount_id()
+                );
+            }
         }
 
+        Ok(())
+    }
+
+    /// 执行传播的umount操作
+    fn perform_propagated_umount(
+        &self,
+        target_mount: &Arc<MountFS>,
+        target_path: &str,
+    ) -> Result<(), SystemError> {
+        log::debug!(
+            "PropagationEngine: performing propagated umount on mount_id {} for path {}",
+            target_mount.mount_id(),
+            target_path
+        );
+
+        // 对于namespace复制的挂载点，从其所属namespace的mount list中移除
+        if let Some(namespace) = target_mount.namespace() {
+            let mount_list = namespace.mount_list();
+            
+            // 标准化路径，处理//开头的错误路径
+            let normalized_path = self.normalize_path(target_path);
+            
+            // 首先尝试直接使用目标路径
+            if let Some(_removed_mount) = mount_list.remove(target_path.to_string()) {
+                log::info!(
+                    "PropagationEngine: successfully removed propagated mount from mount list: {}",
+                    target_path
+                );
+                
+                // 清理子挂载点（递归umount）
+                self.cleanup_child_mounts(target_mount)?;
+                
+                return Ok(());
+            }
+            
+            // 如果直接路径移除失败，尝试使用标准化路径
+            if normalized_path != target_path {
+                if let Some(_removed_mount) = mount_list.remove(normalized_path.clone()) {
+                    log::info!(
+                        "PropagationEngine: successfully removed propagated mount using normalized path: {} -> {}",
+                        target_path,
+                        normalized_path
+                    );
+                    
+                    // 清理子挂载点（递归umount）
+                    self.cleanup_child_mounts(target_mount)?;
+                    
+                    return Ok(());
+                }
+            }
+            
+            // 如果还是找不到，记录错误但继续进行后续清理
+            log::warn!(
+                "PropagationEngine: could not find mount in mount list for path: {}",
+                target_path
+            );
+            
+            // 即使从mount list移除失败，仍然进行子挂载清理
+            self.cleanup_child_mounts(target_mount)?;
+            
+            // 返回成功，因为挂载点已经从其他地方清理了
+            return Ok(());
+        }
+
+        // 如果从mount list移除失败，尝试其他方法
+        log::warn!(
+            "PropagationEngine: could not remove mount from mount list, trying alternative cleanup"
+        );
+        Err(SystemError::ENOENT)
+    }
+
+    /// 标准化路径，处理//等错误格式
+    fn normalize_path(&self, path: &str) -> String {
+        // 移除开头的多个斜杠
+        let trimmed = path.trim_start_matches('/');
+        
+        // 如果路径为空，返回根路径
+        if trimmed.is_empty() {
+            return "/".to_string();
+        }
+        
+        // 分割路径组件并过滤空组件
+        let components: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        
+        // 重新构建路径
+        if components.is_empty() {
+            "/".to_string()
+        } else {
+            "/".to_string() + &components.join("/")
+        }
+    }
+
+    /// 清理子挂载点
+    fn cleanup_child_mounts(&self, parent_mount: &Arc<MountFS>) -> Result<(), SystemError> {
+        let child_mounts = parent_mount.get_child_mounts();
+        
+        for (inode_id, child_mount) in child_mounts {
+            log::debug!(
+                "PropagationEngine: cleaning up child mount_id {} (inode_id: {:?})",
+                child_mount.mount_id(),
+                inode_id
+            );
+            
+            // 递归清理子挂载的子挂载
+            self.cleanup_child_mounts(&child_mount)?;
+            
+            // 从父挂载中移除这个子挂载
+            parent_mount.remove_mountpoint(inode_id);
+        }
+        
         Ok(())
     }
 

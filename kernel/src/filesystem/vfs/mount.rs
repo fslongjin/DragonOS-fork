@@ -166,11 +166,10 @@ impl MountFS {
         new_namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
         mount_id: u32,
     ) -> Arc<Self> {
-        // 创建新的MountFS，在新namespace中保持self_mountpoint为None是可以的
-        // 因为我们会在do_umount2中改进卸载逻辑来处理namespace隔离的情况
+        // 创建新的MountFS
         let new_mount_fs = Self::new_with_namespace(
             self.inner_filesystem.clone(),
-            None, // 在namespace复制中，让卸载通过路径查找而不是self_mountpoint
+            None, // namespace根挂载点的self_mountpoint确实应该是None
             new_namespace.clone(),
             crate::process::namespace::mount_namespace::MountPropagation::new_private(),
             mount_id,
@@ -184,7 +183,7 @@ impl MountFS {
             // 递归复制子挂载点，为每个子挂载点分配新的全局mount ID
             let new_child = child_mount_fs.deep_copy_for_namespace(
                 new_namespace.clone(),
-                crate::process::namespace::mount_namespace::alloc_global_mount_id(), // 分配新的全局mount ID
+                crate::process::namespace::mount_namespace::alloc_global_mount_id(),
             );
             new_mountpoints.insert(*inode_id, new_child);
         }
@@ -567,10 +566,16 @@ impl MountFS {
     /// # Errors
     /// 如果当前文件系统是根文件系统，那么将会返回`EINVAL`
     pub fn umount(&self) -> Result<Arc<MountFS>, SystemError> {
-        self.self_mountpoint
-            .as_ref()
-            .ok_or(SystemError::EINVAL)?
-            .do_umount()
+        if let Some(mountpoint) = &self.self_mountpoint {
+            // 正常情况：从挂载点卸载
+            mountpoint.do_umount()
+        } else {
+            // 处理namespace复制的挂载点：没有self_mountpoint
+            // 这种情况下，我们不能通过do_umount()来卸载，因为它需要从父文件系统中移除挂载点
+            // 对于namespace复制的挂载点，应该通过其他方式处理
+            log::warn!("MountFS::umount() called on namespace copy mount (mount_id: {}), this should be handled by do_umount2", self.mount_id);
+            Err(SystemError::EINVAL)
+        }
     }
 }
 
@@ -578,6 +583,69 @@ impl MountFSInode {
     /// 获取对应的MountFS
     pub fn mount_fs(&self) -> Arc<MountFS> {
         self.mount_fs.clone()
+    }
+
+    /// 清理挂载的传播状态
+    fn cleanup_mount_propagation_state_for_mount(mount_fs: &Arc<MountFS>) -> Result<(), SystemError> {
+        let prop_info = mount_fs.get_propagation_info();
+        
+        log::debug!(
+            "MountFSInode: cleaning up propagation state for mount_id {}, type: {:?}",
+            mount_fs.mount_id(),
+            prop_info.prop_type
+        );
+
+        if let Some(namespace) = mount_fs.namespace() {
+            match prop_info.prop_type {
+                crate::process::namespace::mount_namespace::PropagationType::Shared => {
+                    // 从共享组中移除
+                    if let Some(group_id) = prop_info.shared_group_id {
+                        namespace.leave_shared_group(group_id, &Arc::downgrade(mount_fs))?;
+                        log::info!(
+                            "MountFSInode: removed mount_id {} from shared group {}",
+                            mount_fs.mount_id(),
+                            group_id
+                        );
+                    }
+                }
+                crate::process::namespace::mount_namespace::PropagationType::Slave => {
+                    // 清理slave关系
+                    if let Some(master) = prop_info.master.as_ref().and_then(|w| w.upgrade()) {
+                        if let Err(e) = master.remove_slave_mount(mount_fs) {
+                            log::warn!(
+                                "MountFSInode: failed to remove slave mount_id {} from master: {:?}",
+                                mount_fs.mount_id(),
+                                e
+                            );
+                        }
+                    }
+                    
+                    // 清理自己的slave list
+                    for slave_weak in &prop_info.slaves {
+                        if let Some(slave) = slave_weak.upgrade() {
+                            if let Err(e) = slave.set_master_mount(None) {
+                                log::warn!(
+                                    "MountFSInode: failed to clear master for slave mount_id {}: {:?}",
+                                    slave.mount_id(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                crate::process::namespace::mount_namespace::PropagationType::Private |
+                crate::process::namespace::mount_namespace::PropagationType::Unbindable => {
+                    // 私有和不可绑定挂载没有特殊的清理需求
+                    log::debug!(
+                        "MountFSInode: mount_id {} has {:?} propagation, no special cleanup needed",
+                        mount_fs.mount_id(),
+                        prop_info.prop_type
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 在指定的mount namespace中找到包含当前inode的MountFS
@@ -862,16 +930,60 @@ impl MountFSInode {
             // 检查parent是否与current相同，这通常表示出现了问题
             if parent_inode_id == current_inode_id {
                 log::warn!("do_absolute_path: parent inode is same as current inode {:?}, treating as namespace root", current_inode_id);
-                // 如果当前节点的parent是自己，但又不是全局根节点，说明这可能是namespace根
-                // 在这种情况下，我们需要检查是否已经有足够的路径组件
-                if path_parts.is_empty() {
-                    // 如果没有路径组件，这个节点就是根，直接break
-                    break;
-                } else {
-                    // 如果已经有路径组件，说明我们已经从子目录向上遍历到了namespace根
-                    // 在path_parts前面加上当前namespace的根标识
-                    break;
+                
+                // 遇到namespace边界，尝试从mount list中获取正确路径
+                if let Some(namespace) = current.mount_fs.namespace() {
+                    let mount_list = namespace.mount_list();
+                    
+                    // 在mount list中查找当前mount的路径
+                    let mount_list_guard = mount_list.0.read();
+                    for (mount_path, mount_fs) in mount_list_guard.iter() {
+                        if Arc::ptr_eq(mount_fs, &current.mount_fs) {
+                            log::info!("do_absolute_path: found mount path in mount list: {}", mount_path.0);
+                            
+                            // 重新构建完整路径：mount_path + 已收集的子路径
+                            path_parts.reverse(); // 先反转，因为我们是从下往上收集的
+                            let sub_path = if path_parts.is_empty() {
+                                String::new()
+                            } else {
+                                // 移除最后一个组件（即当前mount的根目录名）
+                                if !path_parts.is_empty() {
+                                    path_parts.remove(path_parts.len() - 1);
+                                }
+                                if path_parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    "/".to_string() + &path_parts.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join("/")
+                                }
+                            };
+                            
+                            let final_path = if mount_path.0 == "/" {
+                                if sub_path.is_empty() {
+                                    "/".to_string()
+                                } else {
+                                    sub_path
+                                }
+                            } else {
+                                mount_path.0.clone() + &sub_path
+                            };
+                            
+                            log::info!("do_absolute_path: constructed final path: {}", final_path);
+                            return Ok(final_path);
+                        }
+                    }
                 }
+                
+                // 如果在mount list中找不到，说明可能是挂载点根
+                if current.is_mountpoint_root().unwrap_or(false) {
+                    if let Some(mountpoint) = &current.mount_fs.self_mountpoint {
+                        log::info!("do_absolute_path: found mountpoint, continuing traversal from parent mount");
+                        current = mountpoint.clone();
+                        continue;
+                    }
+                }
+                
+                // 作为最后手段，直接break
+                break;
             }
 
             current = parent;
@@ -881,7 +993,7 @@ impl MountFSInode {
         path_parts.reverse();
 
         // 构建最终的绝对路径字符串
-        let mut absolute_path = if path_parts.is_empty() {
+        let absolute_path = if path_parts.is_empty() {
             // 如果没有路径组件，说明这是根目录
             String::from("/")
         } else {
@@ -1204,7 +1316,15 @@ impl IndexNode for MountFSInode {
             namespace.handle_mount_propagation(&target_mount_fs, &mount_path, &new_mount_fs)?;
         }
 
-        MOUNT_LIST().insert(mount_path.clone(), new_mount_fs.clone());
+        // 修复：确保在正确的namespace mount list中记录挂载点
+        let mount_list = if let Some(namespace) = target_mount_fs.namespace() {
+            namespace.mount_list()
+        } else {
+            MOUNT_LIST()
+        };
+        
+        log::info!("Mount: recording mount in mount list - path: {}, mount_id: {}", mount_path, new_mount_fs.mount_id());
+        mount_list.insert(mount_path.clone(), new_mount_fs.clone());
         return Ok(new_mount_fs);
     }
 
@@ -1240,8 +1360,13 @@ impl IndexNode for MountFSInode {
             namespace.handle_umount_propagation(&self.mount_fs, &mount_path)?;
         }
 
+        // 清理propagation状态
+        Self::cleanup_mount_propagation_state_for_mount(&self.mount_fs)?;
+
         return self.mount_fs.umount();
     }
+
+
 
     fn absolute_path(&self) -> Result<String, SystemError> {
         self.do_absolute_path()
