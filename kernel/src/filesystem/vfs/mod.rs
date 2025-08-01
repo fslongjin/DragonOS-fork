@@ -2,13 +2,16 @@ pub mod fcntl;
 pub mod file;
 pub mod iov;
 pub mod mount;
-pub mod proc_mounts;
-pub mod vfs_early_init;
 pub mod open;
+pub mod proc_mounts;
+pub mod propagation;
+#[cfg(test)]
+pub mod propagation_tests;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
+pub mod vfs_early_init;
 
 use ::core::{any::Any, fmt::Debug, sync::atomic::AtomicUsize};
 use alloc::{string::String, sync::Arc, vec::Vec};

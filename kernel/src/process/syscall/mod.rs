@@ -1,5 +1,4 @@
 mod sys_clone;
-mod sys_unshare;
 mod sys_execve;
 mod sys_execveat;
 mod sys_exit;
@@ -25,6 +24,7 @@ mod sys_setresuid;
 mod sys_setsid;
 mod sys_setuid;
 mod sys_uname;
+mod sys_unshare;
 mod sys_wait4;
 
 #[cfg(target_arch = "x86_64")]

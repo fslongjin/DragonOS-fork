@@ -43,7 +43,7 @@ pub fn user_path_at(
     path: &str,
 ) -> Result<(Arc<dyn IndexNode>, String), SystemError> {
     let ret_path;
-    
+
     // 如果path不是绝对路径，则需要拼接
     if path.is_empty() || path.as_bytes()[0] != b'/' {
         // 如果dirfd不是AT_FDCWD，则需要检查dirfd是否是目录

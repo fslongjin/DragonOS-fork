@@ -85,9 +85,43 @@ pub fn do_umount2(
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
     let path = work.absolute_path()? + &rest;
 
-    if let Some(fs) = MOUNT_LIST().remove(path) {
+    // 首先尝试从当前namespace的挂载列表中移除
+    if let Some(fs) = MOUNT_LIST().remove(path.clone()) {
         // Todo: 占用检测
-        fs.umount()?;
+        if let Err(e) = fs.umount() {
+            // 如果通过MountFS.umount()失败，尝试直接处理
+            log::warn!(
+                "MountFS.umount() failed for {}: {:?}, trying alternative method",
+                path,
+                e
+            );
+
+            // 对于namespace复制的挂载点，可能self_mountpoint为None
+            // 我们通过路径解析来找到对应的inode并进行卸载
+            let (target_node, rest_path) =
+                user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
+            if rest_path.is_empty() {
+                // 直接在目标inode上执行卸载操作，绕过MountFS.umount()的self_mountpoint检查
+                use crate::filesystem::vfs::mount::is_mountpoint_root;
+                if is_mountpoint_root(&target_node) {
+                    // 这是一个挂载点根目录，强制从父文件系统中移除
+                    let parent = target_node.parent()?;
+                    let metadata = target_node.metadata()?;
+
+                    // 检查父节点是否是MountFSInode，并移除挂载点
+                    if let Some(mount_inode) = parent
+                        .as_any_ref()
+                        .downcast_ref::<crate::filesystem::vfs::mount::MountFSInode>(
+                    ) {
+                        mount_inode.mount_fs().remove_mountpoint(metadata.inode_id);
+                        log::info!("Successfully unmounted {} using alternative method", path);
+                        return Ok(fs);
+                    }
+                }
+            }
+
+            return Err(e);
+        }
         return Ok(fs);
     }
     return Err(SystemError::EINVAL);

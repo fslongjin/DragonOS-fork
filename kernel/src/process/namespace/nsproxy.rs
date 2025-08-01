@@ -4,7 +4,10 @@ use system_error::SystemError;
 use crate::process::{fork::CloneFlags, ProcessControlBlock, ProcessManager};
 use core::{fmt::Debug, intrinsics::likely};
 
-use super::{mount_namespace::MountNamespace, pid_namespace::PidNamespace, user_namespace::UserNamespace, NamespaceType};
+use super::{
+    mount_namespace::MountNamespace, pid_namespace::PidNamespace, user_namespace::UserNamespace,
+    NamespaceType,
+};
 
 /// A structure containing references to all per-process namespaces (filesystem/mount, UTS, network, etc.).
 ///
@@ -49,7 +52,7 @@ impl NsProxy {
     pub fn pid_namespace_for_children(&self) -> &Arc<PidNamespace> {
         &self.pid_ns_for_children
     }
-    
+
     /// 获取mount namespace
     pub fn mount_namespace(&self) -> &Arc<MountNamespace> {
         &self.mount_ns
@@ -128,11 +131,8 @@ fn create_new_namespaces(
         .nsproxy()
         .pid_ns_for_children
         .copy_pid_ns(clone_flags, user_ns.clone())?;
-        
-    let mount_ns = pcb
-        .nsproxy()
-        .mount_ns
-        .copy_mount_ns(clone_flags, user_ns)?;
+
+    let mount_ns = pcb.nsproxy().mount_ns.copy_mount_ns(clone_flags, user_ns)?;
 
     let result = NsProxy {
         pid_ns_for_children,

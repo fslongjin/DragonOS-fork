@@ -282,7 +282,7 @@ impl ProcFSInode {
     fn open_mounts(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 生成mount信息
         let mount_content = Self::generate_mounts_content();
-        
+
         pdata.data = mount_content.as_bytes().to_vec();
         return Ok(pdata.data.len() as i64);
     }
@@ -290,35 +290,33 @@ impl ProcFSInode {
     /// 生成/proc/mounts的内容
     fn generate_mounts_content() -> String {
         use crate::process::ProcessManager;
-        
+
         let mut content = String::new();
-        
+
         // 检查进程管理是否已经初始化
         if ProcessManager::initialized() {
             // 获取当前进程的mount namespace
             let current_pcb = ProcessManager::current_pcb();
             let mount_ns = current_pcb.nsproxy().mount_ns.clone();
-            
+
             // 获取根文件系统信息
             let root_mountfs = mount_ns.root_mountfs();
             let root_fs = root_mountfs.inner_filesystem();
             let root_fs_name = root_fs.name();
             let propagation = root_mountfs.propagation();
-            
+
             content.push_str(&format!(
                 "{} / {} rw,{:?} 0 0\n",
-                root_fs_name,
-                root_fs_name,
-                propagation
+                root_fs_name, root_fs_name, propagation
             ));
         } else {
             content.push_str("# Process management not initialized\n");
         }
-        
+
         if content.is_empty() {
             content.push_str("# No mounts found\n");
         }
-        
+
         content
     }
 
@@ -525,7 +523,11 @@ impl ProcFS {
         }
 
         // 创建mounts文件
-        let binding = inode.create("mounts", FileType::File, ModeType::from_bits_truncate(0o444));
+        let binding = inode.create(
+            "mounts",
+            FileType::File,
+            ModeType::from_bits_truncate(0o444),
+        );
         if let Ok(mounts) = binding {
             let mounts_file = mounts
                 .as_any_ref()

@@ -2,3 +2,6 @@ test_mount_namespace
 *.o
 *.a
 .DS_Store
+simple_test
+test_propagation
+comprehensive_propagation_test

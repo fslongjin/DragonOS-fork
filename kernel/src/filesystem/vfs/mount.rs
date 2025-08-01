@@ -12,6 +12,24 @@ use alloc::{
 };
 use system_error::SystemError;
 
+/// Mount flags for mount propagation
+pub mod mount_flags {
+    /// 创建一个私有挂载，默认行为
+    pub const MS_PRIVATE: usize = 1 << 18;
+    /// 创建一个共享挂载
+    pub const MS_SHARED: usize = 1 << 20;
+    /// 创建一个从属挂载
+    pub const MS_SLAVE: usize = 1 << 19;
+    /// 创建一个不可绑定挂载
+    pub const MS_UNBINDABLE: usize = 1 << 17;
+
+    /// 递归标志，用于递归地设置传播类型
+    pub const MS_REC: usize = 16384;
+
+    /// Bind mount标志
+    pub const MS_BIND: usize = 4096;
+}
+
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -148,10 +166,11 @@ impl MountFS {
         new_namespace: Weak<crate::process::namespace::mount_namespace::MountNamespace>,
         mount_id: u32,
     ) -> Arc<Self> {
-        // 创建新的MountFS，使用相同的内部文件系统但独立的mountpoints
+        // 创建新的MountFS，在新namespace中保持self_mountpoint为None是可以的
+        // 因为我们会在do_umount2中改进卸载逻辑来处理namespace隔离的情况
         let new_mount_fs = Self::new_with_namespace(
             self.inner_filesystem.clone(),
-            None, // 在新namespace中，这个MountFS没有父挂载点引用
+            None, // 在namespace复制中，让卸载通过路径查找而不是self_mountpoint
             new_namespace.clone(),
             crate::process::namespace::mount_namespace::MountPropagation::new_private(),
             mount_id,
@@ -179,6 +198,221 @@ impl MountFS {
     /// 获取挂载ID
     pub fn mount_id(&self) -> u32 {
         self.mount_id
+    }
+
+    /// 检查是否是namespace复制的挂载点（没有self_mountpoint引用）
+    pub fn is_namespace_copy(&self) -> bool {
+        self.self_mountpoint.is_none()
+    }
+
+    /// 移除子挂载点（用于强制卸载）
+    pub fn remove_mountpoint(&self, inode_id: InodeId) -> Option<Arc<MountFS>> {
+        self.mountpoints.lock().remove(&inode_id)
+    }
+
+    /// 获取子挂载点列表（用于传播引擎）
+    pub fn get_child_mounts(&self) -> Vec<(InodeId, Arc<MountFS>)> {
+        let mountpoints = self.mountpoints.lock();
+        mountpoints
+            .iter()
+            .map(|(id, mount)| (*id, mount.clone()))
+            .collect()
+    }
+
+    /// 添加从属挂载（用于master-slave关系）
+    pub fn add_slave_mount(&self, slave: Arc<MountFS>) -> Result<(), SystemError> {
+        let mut prop = self.propagation.write();
+        prop.add_slave(Arc::downgrade(&slave));
+        Ok(())
+    }
+
+    /// 移除从属挂载
+    pub fn remove_slave_mount(&self, slave: &Arc<MountFS>) -> Result<(), SystemError> {
+        let mut prop = self.propagation.write();
+        prop.remove_slave(&Arc::downgrade(slave));
+        Ok(())
+    }
+
+    /// 设置master挂载（用于slave挂载）
+    pub fn set_master_mount(&self, master: Option<Arc<MountFS>>) -> Result<(), SystemError> {
+        let mut prop = self.propagation.write();
+        prop.master = master.map(|m| Arc::downgrade(&m));
+        Ok(())
+    }
+
+    /// 设置共享组ID
+    pub fn set_shared_group_id(&self, group_id: Option<u32>) -> Result<(), SystemError> {
+        let mut prop = self.propagation.write();
+        prop.shared_group_id = group_id;
+        prop.peer_group_id = group_id;
+        Ok(())
+    }
+
+    /// 创建bind mount
+    pub fn create_bind_mount(
+        &self,
+        target_path: &str,
+        flags: u32,
+    ) -> Result<Arc<MountFS>, SystemError> {
+        log::info!(
+            "MountFS: creating bind mount from mount_id {} to {}",
+            self.mount_id(),
+            target_path
+        );
+
+        // 检查是否为unbindable
+        if self.propagation()
+            == crate::process::namespace::mount_namespace::PropagationType::Unbindable
+        {
+            log::error!("MountFS: cannot bind mount unbindable filesystem");
+            return Err(SystemError::EINVAL);
+        }
+
+        // 获取当前的namespace
+        let namespace = self.namespace().ok_or(SystemError::EINVAL)?;
+
+        // 分配新的mount ID
+        let mount_id = crate::process::namespace::mount_namespace::alloc_global_mount_id();
+
+        // 创建新的MountFS，共享相同的文件系统
+        let bind_mount = MountFS::new_with_namespace(
+            self.inner_filesystem.clone(),
+            None, // 将在实际挂载时设置
+            Arc::downgrade(&namespace),
+            self.get_propagation_info(), // 继承传播属性
+            mount_id,
+        );
+
+        // 处理传播标志
+        let flags = flags as usize; // 转换为usize以匹配mount_flags常量
+        if flags & mount_flags::MS_SHARED != 0 {
+            bind_mount.set_propagation(
+                crate::process::namespace::mount_namespace::PropagationType::Shared,
+            )?;
+        } else if flags & mount_flags::MS_PRIVATE != 0 {
+            bind_mount.set_propagation(
+                crate::process::namespace::mount_namespace::PropagationType::Private,
+            )?;
+        } else if flags & mount_flags::MS_SLAVE != 0 {
+            bind_mount.set_propagation(
+                crate::process::namespace::mount_namespace::PropagationType::Slave,
+            )?;
+            // 建立master-slave关系
+            namespace.establish_master_slave_relationship(
+                &self.self_ref.upgrade().unwrap(),
+                &bind_mount,
+            )?;
+        } else if flags & mount_flags::MS_UNBINDABLE != 0 {
+            bind_mount.set_propagation(
+                crate::process::namespace::mount_namespace::PropagationType::Unbindable,
+            )?;
+        }
+
+        // 处理bind mount传播
+        namespace.handle_bind_mount(&bind_mount, target_path, flags as u32)?;
+
+        log::info!(
+            "MountFS: bind mount created with mount_id {}",
+            bind_mount.mount_id()
+        );
+        Ok(bind_mount)
+    }
+
+    /// 检查两个MountFS是否在同一个共享组
+    pub fn is_in_same_shared_group(&self, other: &Arc<MountFS>) -> bool {
+        let self_prop = self.get_propagation_info();
+        let other_prop = other.get_propagation_info();
+
+        match (self_prop.shared_group_id, other_prop.shared_group_id) {
+            (Some(self_group), Some(other_group)) => self_group == other_group,
+            _ => false,
+        }
+    }
+
+    /// 检查是否是另一个挂载的slave
+    pub fn is_slave_of(&self, potential_master: &Arc<MountFS>) -> bool {
+        let prop_info = self.get_propagation_info();
+
+        if let Some(master_weak) = &prop_info.master {
+            if let Some(master) = master_weak.upgrade() {
+                return Arc::ptr_eq(&master, potential_master);
+            }
+        }
+
+        false
+    }
+
+    /// 获取所有slave挂载
+    pub fn get_slave_mounts(&self) -> Vec<Arc<MountFS>> {
+        let prop_info = self.get_propagation_info();
+        prop_info
+            .slaves
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .collect()
+    }
+
+    /// 清理过期的slave引用
+    pub fn cleanup_stale_slaves(&self) -> Result<(), SystemError> {
+        let mut prop = self.propagation.write();
+        prop.cleanup_stale_slaves();
+        Ok(())
+    }
+
+    /// 检查是否是bind mount（共享相同的底层文件系统）
+    pub fn is_bind_mount_of(&self, other: &Arc<MountFS>) -> bool {
+        // 比较底层文件系统的指针
+        Arc::ptr_eq(&self.inner_filesystem, &other.inner_filesystem)
+    }
+
+    /// 获取bind mount的源挂载（如果是bind mount的话）
+    pub fn get_bind_source(&self) -> Option<Arc<MountFS>> {
+        // 这里需要通过某种方式追踪bind mount的源
+        // 在实际实现中，可能需要在MountFS中添加源引用字段
+        // 目前简化实现，返回None
+        None
+    }
+
+    /// 检查挂载是否支持bind mount
+    pub fn supports_bind_mount(&self) -> bool {
+        // 检查传播类型是否允许bind mount
+        !matches!(
+            self.propagation(),
+            crate::process::namespace::mount_namespace::PropagationType::Unbindable
+        )
+    }
+
+    /// 插入子挂载点（用于传播）
+    pub fn insert_mountpoint(&self, inode_id: InodeId, mount_fs: Arc<MountFS>) {
+        self.mountpoints.lock().insert(inode_id, mount_fs);
+    }
+
+    /// 创建挂载的完整路径信息字符串（用于调试）
+    pub fn get_mount_info_string(&self) -> alloc::string::String {
+        let prop_info = self.get_propagation_info();
+        let namespace = self.namespace();
+
+        let mut info = alloc::format!(
+            "mount_id: {}, fs: {}, prop: {:?}",
+            self.mount_id(),
+            self.inner_filesystem.name(),
+            prop_info.prop_type
+        );
+
+        if let Some(group_id) = prop_info.shared_group_id {
+            info.push_str(&alloc::format!(", shared_group: {}", group_id));
+        }
+
+        if let Some(_ns) = namespace {
+            // 简化实现，避免导入额外的trait
+            info.push_str(", has_namespace: true");
+        }
+
+        if !prop_info.slaves.is_empty() {
+            info.push_str(&alloc::format!(", slaves: {}", prop_info.slaves.len()));
+        }
+
+        info
     }
 
     /// 获取所属的namespace
@@ -218,38 +452,115 @@ impl MountFS {
     ) -> Result<(), SystemError> {
         use crate::process::namespace::mount_namespace::PropagationType;
 
+        log::info!(
+            "MountFS: setting propagation type to {:?} for mount_id {}",
+            prop_type,
+            self.mount_id()
+        );
+
+        let old_type = {
+            let prop = self.propagation.read();
+            prop.prop_type
+        };
+
+        if old_type == prop_type {
+            log::debug!("MountFS: propagation type unchanged, skipping");
+            return Ok(());
+        }
+
         let mut prop = self.propagation.write();
 
-        match prop_type {
+        // 清理旧的传播状态
+        match old_type {
             PropagationType::Shared => {
-                // 加入或创建共享组
-                let ns = self.namespace.read().upgrade();
-                if let Some(ns) = ns {
-                    let group_id = ns.create_or_join_shared_group(self.self_ref.clone())?;
-                    prop.shared_group_id = Some(group_id);
-                }
-            }
-            PropagationType::Private => {
                 // 退出共享组
                 if let Some(group_id) = prop.shared_group_id.take() {
+                    drop(prop); // 释放锁以避免死锁
                     let ns = self.namespace.read().upgrade();
                     if let Some(ns) = ns {
                         ns.leave_shared_group(group_id, &self.self_ref)?;
                     }
+                    prop = self.propagation.write(); // 重新获取锁
+                }
+            }
+            PropagationType::Slave => {
+                // 清除master引用，在master中移除自己
+                if let Some(master_weak) = prop.master.take() {
+                    if let Some(master) = master_weak.upgrade() {
+                        drop(prop); // 释放锁
+                        master.remove_slave_mount(&self.self_ref.upgrade().unwrap())?;
+                        prop = self.propagation.write(); // 重新获取锁
+                    }
                 }
             }
             _ => {
-                // 其他类型的处理
+                // Private和Unbindable无需特殊清理
+            }
+        }
+
+        // 设置新的传播状态
+        match prop_type {
+            PropagationType::Shared => {
+                // 加入或创建共享组
+                drop(prop); // 释放锁
+                let ns = self.namespace.read().upgrade();
+                if let Some(ns) = ns {
+                    let group_id = ns.create_or_join_shared_group(self.self_ref.clone())?;
+                    prop = self.propagation.write(); // 重新获取锁
+                    prop.shared_group_id = Some(group_id);
+                    prop.peer_group_id = Some(group_id);
+                } else {
+                    prop = self.propagation.write(); // 重新获取锁
+                }
+
+                // 清除master引用（shared不能有master）
+                prop.master = None;
+            }
+            PropagationType::Private => {
+                // 已在上面清理过共享组，这里只需清除其他状态
+                prop.shared_group_id = None;
+                prop.peer_group_id = None;
+                prop.master = None;
+                // 清空slaves列表
+                prop.slaves.clear();
+            }
+            PropagationType::Slave => {
+                // Slave类型需要有master，但这里只是设置类型
+                // master会通过其他方法设置
+                prop.shared_group_id = None;
+                prop.peer_group_id = None;
+                // master在establish_master_slave_relationship中设置
+            }
+            PropagationType::Unbindable => {
+                // 不可绑定类型
+                prop.shared_group_id = None;
+                prop.peer_group_id = None;
+                prop.master = None;
+                prop.slaves.clear();
             }
         }
 
         prop.prop_type = prop_type;
+        log::info!(
+            "MountFS: propagation type changed from {:?} to {:?} for mount_id {}",
+            old_type,
+            prop_type,
+            self.mount_id()
+        );
         Ok(())
     }
 
     /// 获取propagation信息
     pub fn propagation(&self) -> crate::process::namespace::mount_namespace::PropagationType {
         self.propagation.read().prop_type
+    }
+
+    /// 获取完整的propagation信息
+    pub fn get_propagation_info(
+        &self,
+    ) -> crate::process::namespace::mount_namespace::MountPropagation {
+        let prop = self.propagation.read();
+        prop.clone()
     }
 
     /// 卸载文件系统
@@ -512,24 +823,78 @@ impl MountFSInode {
     fn do_absolute_path(&self) -> Result<String, SystemError> {
         let mut path_parts = Vec::new();
         let mut current = self.self_ref.upgrade().unwrap();
+        let mut visited_inodes = alloc::collections::BTreeSet::new();
+        const MAX_PATH_DEPTH: usize = 4096; // 防止路径过深
 
-        while current.metadata()?.inode_id != ROOT_INODE().metadata()?.inode_id {
+        loop {
+            let current_inode_id = current.metadata()?.inode_id;
+
+            // 检查是否到达根节点
+            if current_inode_id == ROOT_INODE().metadata()?.inode_id {
+                break;
+            }
+
+            // 检查循环引用 - 如果已经访问过这个inode，说明存在循环
+            if visited_inodes.contains(&current_inode_id) {
+                log::error!(
+                    "do_absolute_path: detected circular reference at inode_id {:?}",
+                    current_inode_id
+                );
+                return Err(SystemError::ELOOP);
+            }
+
+            // 检查路径深度，防止无限循环
+            if path_parts.len() >= MAX_PATH_DEPTH {
+                log::error!(
+                    "do_absolute_path: path depth exceeded {} levels",
+                    MAX_PATH_DEPTH
+                );
+                return Err(SystemError::ENAMETOOLONG);
+            }
+
+            visited_inodes.insert(current_inode_id);
             let name = current.dname()?;
             path_parts.push(name.0);
-            current = current.do_parent()?;
+
+            let parent = current.do_parent()?;
+            let parent_inode_id = parent.metadata()?.inode_id;
+
+            // 检查parent是否与current相同，这通常表示出现了问题
+            if parent_inode_id == current_inode_id {
+                log::warn!("do_absolute_path: parent inode is same as current inode {:?}, treating as namespace root", current_inode_id);
+                // 如果当前节点的parent是自己，但又不是全局根节点，说明这可能是namespace根
+                // 在这种情况下，我们需要检查是否已经有足够的路径组件
+                if path_parts.is_empty() {
+                    // 如果没有路径组件，这个节点就是根，直接break
+                    break;
+                } else {
+                    // 如果已经有路径组件，说明我们已经从子目录向上遍历到了namespace根
+                    // 在path_parts前面加上当前namespace的根标识
+                    break;
+                }
+            }
+
+            current = parent;
         }
 
         // 由于我们从叶子节点向上遍历到根节点，所以需要反转路径部分
         path_parts.reverse();
 
         // 构建最终的绝对路径字符串
-        let mut absolute_path = String::with_capacity(
-            path_parts.iter().map(|s| s.len()).sum::<usize>() + path_parts.len(),
-        );
-        for part in path_parts {
-            absolute_path.push('/');
-            absolute_path.push_str(&part);
-        }
+        let mut absolute_path = if path_parts.is_empty() {
+            // 如果没有路径组件，说明这是根目录
+            String::from("/")
+        } else {
+            // 计算容量：所有部分的长度 + 分隔符数量 + 1（开头的/）
+            let mut result = String::with_capacity(
+                path_parts.iter().map(|s| s.len()).sum::<usize>() + path_parts.len() + 1,
+            );
+            for part in path_parts {
+                result.push('/');
+                result.push_str(&part);
+            }
+            result
+        };
 
         Ok(absolute_path)
     }
@@ -781,7 +1146,8 @@ impl IndexNode for MountFSInode {
                 // 进程管理未初始化，但我们仍然要创建namespace-aware的MountFS
                 // 使用root mount namespace
                 let mount_id = crate::process::namespace::mount_namespace::alloc_global_mount_id();
-                let root_mount_ns = crate::process::namespace::mount_namespace::init_mount_namespace();
+                let root_mount_ns =
+                    crate::process::namespace::mount_namespace::init_mount_namespace();
                 let namespace_ref = Arc::downgrade(&root_mount_ns);
 
                 log::info!(

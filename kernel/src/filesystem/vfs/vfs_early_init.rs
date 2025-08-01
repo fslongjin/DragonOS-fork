@@ -7,6 +7,9 @@ use crate::process::namespace::mount_namespace::init_mount_namespace;
 /// 早期VFS初始化完成后的回调，用于设置mount namespace关联
 /// 这个函数只应该在VFS初始化时调用一次
 pub fn vfs_mount_namespace_init(root_mount_fs: Arc<MountFS>) -> Result<(), SystemError> {
+    // 初始化传播引擎
+    crate::filesystem::vfs::propagation::init_propagation_engine();
+
     // 获取根mount namespace
     let root_namespace = init_mount_namespace();
 

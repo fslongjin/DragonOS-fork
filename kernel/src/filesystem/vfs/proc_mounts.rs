@@ -44,32 +44,30 @@ impl ProcMountsInode {
     /// 生成/proc/mounts的内容
     fn generate_mounts_content() -> String {
         let mut content = String::new();
-        
+
         // 获取当前进程的mount namespace
         let current_pcb = ProcessManager::current_pcb();
         let mount_ns = current_pcb.nsproxy().mount_ns.clone();
-        
+
         // 简化实现：显示基本信息
         content.push_str("# Mount namespace information\n");
         content.push_str("# Device MountPoint FileSystemType Options Dump Pass\n");
-        
+
         // 获取根文件系统信息
         let root_mountfs = mount_ns.root_mountfs();
         let root_fs = root_mountfs.inner_filesystem();
         let root_fs_name = root_fs.name();
         let propagation = root_mountfs.propagation();
-        
+
         content.push_str(&format!(
             "{} / {} rw,{:?} 0 0\n",
-            root_fs_name,
-            root_fs_name,
-            propagation
+            root_fs_name, root_fs_name, propagation
         ));
-        
+
         if content.is_empty() {
             content.push_str("# No mounts found\n");
         }
-        
+
         content
     }
 }
@@ -84,14 +82,14 @@ impl IndexNode for ProcMountsInode {
     ) -> Result<usize, SystemError> {
         let content = Self::generate_mounts_content();
         let content_bytes = content.as_bytes();
-        
+
         if offset >= content_bytes.len() {
             return Ok(0);
         }
-        
+
         let end = (offset + len).min(content_bytes.len());
         let read_len = end - offset;
-        
+
         buf[..read_len].copy_from_slice(&content_bytes[offset..end]);
         Ok(read_len)
     }
@@ -239,11 +237,17 @@ impl IndexNode for ProcMountsInode {
         Err(SystemError::EPERM)
     }
 
-    fn mount(&self, _fs: Arc<dyn FileSystem>) -> Result<Arc<crate::filesystem::vfs::mount::MountFS>, SystemError> {
+    fn mount(
+        &self,
+        _fs: Arc<dyn FileSystem>,
+    ) -> Result<Arc<crate::filesystem::vfs::mount::MountFS>, SystemError> {
         Err(SystemError::ENOTDIR)
     }
 
-    fn mount_from(&self, _from: Arc<dyn IndexNode>) -> Result<Arc<crate::filesystem::vfs::mount::MountFS>, SystemError> {
+    fn mount_from(
+        &self,
+        _from: Arc<dyn IndexNode>,
+    ) -> Result<Arc<crate::filesystem::vfs::mount::MountFS>, SystemError> {
         Err(SystemError::ENOTDIR)
     }
 
@@ -269,7 +273,9 @@ impl IndexNode for ProcMountsInode {
     }
 
     fn dname(&self) -> Result<crate::filesystem::vfs::utils::DName, SystemError> {
-        Ok(crate::filesystem::vfs::utils::DName(Arc::new(String::from("mounts"))))
+        Ok(crate::filesystem::vfs::utils::DName(Arc::new(
+            String::from("mounts"),
+        )))
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

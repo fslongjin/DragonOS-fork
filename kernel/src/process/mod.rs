@@ -102,8 +102,6 @@ pub static mut PROCESS_SWITCH_RESULT: Option<PerCpuVar<SwitchResult>> = None;
 /// 一个只改变1次的全局变量，标志进程管理器是否已经初始化完成
 static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 
-
-
 pub struct SwitchResult {
     pub prev_pcb: Option<Arc<ProcessControlBlock>>,
     pub next_pcb: Option<Arc<ProcessControlBlock>>,
@@ -1938,6 +1936,13 @@ impl KernelStack {
 
         let new_arc: Arc<ProcessControlBlock> = weak_wrapper.upgrade()?;
         return Some(new_arc);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn current_usage() -> usize {
+        let stack_ptr = x86::current::registers::rsp() as usize;
+        let stack_base = (stack_ptr + KernelStack::SIZE) & (!(KernelStack::ALIGN - 1));
+        return stack_base - stack_ptr;
     }
 }
 

@@ -34,7 +34,7 @@ lazy_static! {
 pub static CONSOLE_BLANKED: AtomicBool = AtomicBool::new(false);
 
 /// ## 虚拟控制台的信息
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VirtualConsoleData {
     pub vc_index: usize,
     pub state: VirtualConsoleInfo,
