@@ -393,13 +393,14 @@ impl ProcessManager {
         // 切换gsbase
         Self::switch_gsbase(&prev, &next);
 
-        // 切换地址空间
-        let next_addr_space = next.basic().user_vm().as_ref().unwrap().clone();
-        compiler_fence(Ordering::SeqCst);
-
-        next_addr_space.read().user_mapper.utable.make_current();
-        drop(next_addr_space);
-        compiler_fence(Ordering::SeqCst);
+        // 切换地址空间（仅当目标进程有用户地址空间时才切换）
+        // 内核线程没有用户地址空间，因此不需要切换用户页表
+        if let Some(next_addr_space) = next.basic().user_vm() {
+            compiler_fence(Ordering::SeqCst);
+            next_addr_space.read().user_mapper.utable.make_current();
+            drop(next_addr_space);
+            compiler_fence(Ordering::SeqCst);
+        }
         // 切换内核栈
 
         // 获取arch info的锁，并强制泄露其守卫（切换上下文后，在switch_finish_hook中会释放锁）

@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 members = ["crates/*"]
 
 [features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test", "sched_new"]
 # kvm
 kvm = []
 
@@ -30,6 +30,9 @@ kstack_protect = []
 
 # initram
 initram = []
+
+# sched_new: 使用新的调度子系统 (RR + IDLE)
+sched_new = []
 
 # 运行时依赖项
 [dependencies]

@@ -65,6 +65,8 @@ mod net;
 mod perf;
 mod process;
 mod sched;
+#[cfg(feature = "sched_new")]
+mod sched_new;
 mod smp;
 mod syscall;
 mod time;

@@ -238,6 +238,7 @@ impl Signal {
     ///
     /// 当我们对于进程组中的所有进程都运行了这个检查之后，我们将可以找到组内愿意接收信号的进程。
     /// 这么做是为了防止我们把信号发送给了一个正在或已经退出的进程，或者是不响应该信号的进程。
+    #[cfg(not(feature = "sched_new"))]
     #[inline]
     fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
         // 若进程正在退出，则不能接收
@@ -272,6 +273,52 @@ impl Signal {
             state.is_blocked() && (!state.is_blocked_interruptable());
 
         if is_blocked_non_interruptable {
+            return false;
+        }
+
+        return true;
+    }
+
+    /// 本函数用于检测指定的进程是否想要接收SIG这个信号（新调度器版本）。
+    ///
+    /// 以 SchedEntity 的 SchedState 为准进行判断。
+    #[cfg(feature = "sched_new")]
+    #[inline]
+    fn wants_signal(&self, pcb: Arc<ProcessControlBlock>) -> bool {
+        use crate::sched_new::SchedState;
+
+        // 若进程正在退出，则不能接收
+        if pcb.flags().contains(ProcessFlags::EXITING) {
+            return false;
+        }
+
+        // SIGKILL 总是唤醒
+        if *self == Signal::SIGKILL {
+            return true;
+        }
+
+        // 以 SchedState 为准判断是否处于可中断睡眠
+        let sched_state = pcb.sched_entity().state();
+        let is_interruptible = sched_state == SchedState::Interruptible;
+        let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
+
+        // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
+        // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
+        if is_interruptible && has_restore_sig_mask {
+            return true;
+        }
+
+        // 常规规则：被屏蔽则不唤醒；否则在可中断阻塞下唤醒
+        let blocked = *pcb.sig_info_irqsave().sig_blocked();
+        let is_blocked = blocked.contains((*self).into());
+
+        if is_blocked {
+            return false;
+        }
+
+        // 不可中断睡眠状态下不接收信号
+        let is_uninterruptible = sched_state == SchedState::Uninterruptible;
+        if is_uninterruptible {
             return false;
         }
 
@@ -370,13 +417,13 @@ impl Signal {
     }
 }
 
-/// 因收到信号而唤醒进程
+/// 因收到信号而唤醒进程（旧调度器版本）
 ///
 /// ## 参数
 ///
 /// - `pcb` 要唤醒的进程pcb
-/// - `_guard` 信号结构体锁守卫，来保证信号结构体已上锁
 /// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
+#[cfg(not(feature = "sched_new"))]
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果是 fatal 的话就唤醒 stop 和 block 的进程来响应，因为唤醒后就会终止
@@ -406,30 +453,65 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 强制让目标CPU陷入内核，尽快处理 pending 的信号（包括作业控制停止/继续）
     // 即使目标任务当前处于 Runnable，也需要 kick 以触发内核路径的 do_signal。
     if wakeup_ok {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
         ProcessManager::kick(&pcb);
     } else if fatal {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> wakeup+kick",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
         let _r = ProcessManager::wakeup(&pcb).map(|_| {
             ProcessManager::kick(&pcb);
         });
     } else if !state.is_stopped() {
-        // log::debug!(
-        //     "signal_wake_up: target pid={:?}, state={:?}, fatal={} -> kick only",
-        //     pcb.raw_pid(),
-        //     state,
-        //     fatal
-        // );
+        ProcessManager::kick(&pcb);
+    }
+}
+
+/// 因收到信号而唤醒进程（新调度器版本）
+///
+/// 以 SchedEntity 的 SchedState 为准进行判断。
+///
+/// ## 参数
+///
+/// - `pcb` 要唤醒的进程pcb
+/// - `fatal` 表明这个信号是不是致命的(会导致进程退出)
+#[cfg(feature = "sched_new")]
+#[inline]
+fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
+    use crate::sched_new::SchedState;
+    use crate::process::ProcessState;
+
+    // 以 SchedState 为准判断
+    let sched_state = pcb.sched_entity().state();
+    // 同时获取 ProcessState 用于检查 Stopped 状态（作业控制语义）
+    let process_state = pcb.sched_info().inner_lock_read_irqsave().state();
+
+    let mut wakeup_ok = true;
+
+    // 可中断睡眠状态可以被信号唤醒
+    if sched_state == SchedState::Interruptible {
+        ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
+            wakeup_ok = false;
+            warn!(
+                "Current pid: {:?}, signal_wake_up target {:?} error: {:?}",
+                ProcessManager::current_pcb().raw_pid(),
+                pcb.raw_pid(),
+                e
+            );
+        });
+    } else if process_state.is_stopped() {
+        // 对已处于 Stopped 的任务，除非致命信号，否则不要唤醒为 Runnable
+        // SIGCONT 的唤醒在 prepare_signal(SIGCONT) 路径专门处理
+        wakeup_ok = false;
+    } else {
+        wakeup_ok = false;
+    }
+
+    // 强制让目标CPU陷入内核，尽快处理 pending 的信号（包括作业控制停止/继续）
+    // 即使目标任务当前处于 Runnable，也需要 kick 以触发内核路径的 do_signal。
+    if wakeup_ok {
+        ProcessManager::kick(&pcb);
+    } else if fatal {
+        let _r = ProcessManager::wakeup(&pcb).map(|_| {
+            ProcessManager::kick(&pcb);
+        });
+    } else if !process_state.is_stopped() {
         ProcessManager::kick(&pcb);
     }
 }

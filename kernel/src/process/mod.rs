@@ -68,6 +68,9 @@ use crate::{
     },
     syscall::user_access::clear_user_protected,
 };
+
+#[cfg(feature = "sched_new")]
+use crate::sched_new::{SchedEntity, SchedState};
 use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
@@ -230,6 +233,7 @@ impl ProcessManager {
     }
 
     /// 唤醒一个进程
+    #[cfg(not(feature = "sched_new"))]
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
@@ -269,7 +273,40 @@ impl ProcessManager {
         }
     }
 
+    /// 唤醒一个进程（新调度器版本）
+    ///
+    /// 以 SchedEntity 的 SchedState 为准判断是否可唤醒，
+    /// 同时同步更新 ProcessState 以保持兼容性。
+    #[cfg(feature = "sched_new")]
+    pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let entity = pcb.sched_entity();
+        let sched_state = entity.state();
+
+        // 以 SchedState 为准判断是否可唤醒
+        if sched_state.is_wakeable() {
+            // 同步更新 ProcessState
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            writer.set_state(ProcessState::Runnable);
+            writer.set_wakeup();
+            drop(writer);
+
+            // 使用新调度器入队（这会设置 SchedState 为 Runnable）
+            crate::sched_new::wakeup(entity);
+            return Ok(());
+        } else if sched_state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else if sched_state.is_runnable() {
+            // 已经是可运行状态，无需操作
+            return Ok(());
+        } else {
+            // Running 状态，无需唤醒
+            return Ok(());
+        }
+    }
+
     /// 唤醒暂停的进程
+    #[cfg(not(feature = "sched_new"))]
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let state = pcb.sched_info().inner_lock_read_irqsave().state();
@@ -311,10 +348,46 @@ impl ProcessManager {
         }
     }
 
+    /// 唤醒暂停的进程（新调度器版本）
+    ///
+    /// 以 SchedEntity 的 SchedState 为准判断是否可唤醒，
+    /// 同时同步更新 ProcessState 以保持兼容性。
+    #[cfg(feature = "sched_new")]
+    pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        
+        let entity = pcb.sched_entity();
+        let sched_state = entity.state();
+
+        // 检查是否是 Stopped 状态（专门用于作业控制唤醒）
+        if sched_state.is_stop_wakeable() {
+            // 同步更新 ProcessState
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            writer.set_state(ProcessState::Runnable);
+            drop(writer);
+
+            // 唤醒 Stopped 状态的进程
+            crate::sched_new::wakeup(entity);
+            return Ok(());
+        } else if sched_state.is_runnable() || sched_state == SchedState::Running {
+            // 已经在运行或可运行状态
+            return Ok(());
+        } else if sched_state.is_exited() {
+            return Err(SystemError::EINVAL);
+        } else {
+            // 不是 Stopped 状态，不应该被 wakeup_stop 唤醒
+            return Err(SystemError::EINVAL);
+        }
+    }
+
     /// 异步将目标进程置为停止状态（用于 SIGSTOP/SIGTSTP 等作业控制停止）
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
     /// 与 `mark_stop`（仅当前进程）相对应。
+    ///
+    /// 在新调度器模式下，由于 SchedState 没有 Stopped 状态，
+    /// 我们将 SchedState 设置为 Uninterruptible 以阻止调度，
+    /// 同时保持 ProcessState::Stopped 用于作业控制语义。
     pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let mut writer = pcb.sched_info().inner_lock_write_irqsave();
@@ -323,6 +396,11 @@ impl ProcessManager {
             writer.set_state(ProcessState::Stopped);
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
+
+            // 在新调度器中，将 SchedState 设置为 Stopped
+            #[cfg(feature = "sched_new")]
+            pcb.sched_entity().mark_stopped();
+
             return Ok(());
         }
         return Err(SystemError::EINTR);
@@ -335,6 +413,7 @@ impl ProcessManager {
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
     /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
+    #[cfg(not(feature = "sched_new"))]
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
@@ -353,12 +432,49 @@ impl ProcessManager {
         return Err(SystemError::EINTR);
     }
 
+    /// 标志当前进程永久睡眠（新调度器版本）
+    ///
+    /// 以 SchedState 为准判断是否可以睡眠
+    #[cfg(feature = "sched_new")]
+    pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
+            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
+        );
+        let pcb = ProcessManager::current_pcb();
+        let entity = pcb.sched_entity();
+        let sched_state = entity.state();
+
+        // 以 SchedState 为准判断是否可以睡眠
+        if !sched_state.is_exited() {
+            // 同步更新 ProcessState（保持兼容性）
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            writer.set_state(ProcessState::Blocked(interruptable));
+            writer.set_sleep();
+            drop(writer);
+
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+
+            // 设置 SchedState
+            if interruptable {
+                entity.mark_interruptible();
+            } else {
+                entity.mark_uninterruptible();
+            }
+
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
+    }
+
     /// 标志当前进程为停止状态，但是发起调度的工作，应该由调用者完成
     ///
     /// ## 注意
     ///
     /// - 进入当前函数之前，不能持有sched_info的锁
     /// - 进入当前函数之前，必须关闭中断
+    #[cfg(not(feature = "sched_new"))]
     pub fn mark_stop() -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
@@ -371,6 +487,41 @@ impl ProcessManager {
             writer.set_state(ProcessState::Stopped);
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             drop(writer);
+            return Ok(());
+        }
+        return Err(SystemError::EINTR);
+    }
+
+    /// 标志当前进程为停止状态（新调度器版本）
+    ///
+    /// 以 SchedState 为准判断是否可以停止
+    ///
+    /// ## 注意
+    ///
+    /// - 进入当前函数之前，不能持有sched_info的锁
+    /// - 进入当前函数之前，必须关闭中断
+    #[cfg(feature = "sched_new")]
+    pub fn mark_stop() -> Result<(), SystemError> {
+        assert!(
+            !CurrentIrqArch::is_irq_enabled(),
+            "interrupt must be disabled before enter ProcessManager::mark_stop()"
+        );
+
+        let pcb = ProcessManager::current_pcb();
+        let entity = pcb.sched_entity();
+        let sched_state = entity.state();
+
+        // 以 SchedState 为准判断是否可以停止
+        if !sched_state.is_exited() {
+            // 同步更新 ProcessState（保持兼容性）
+            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
+            writer.set_state(ProcessState::Stopped);
+            drop(writer);
+
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
+
+            // 设置 SchedState 为 Stopped
+            entity.mark_stopped();
 
             return Ok(());
         }
@@ -440,6 +591,7 @@ impl ProcessManager {
     ///  对于正常退出的进程，状态码应该先左移八位，以便用户态读取的时候正常返回退出码；而对于被信号终止的进程，状态码则是最低七位，无需进行移位操作。
     ///
     ///  因此注意，传入的`exit_code`应该是已经完成了移位操作的
+    #[cfg(not(feature = "sched_new"))]
     pub fn exit(exit_code: usize) -> ! {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
@@ -522,6 +674,85 @@ impl ProcessManager {
         }
 
         __schedule(SchedMode::SM_NONE);
+        error!("raw_pid {raw_pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop {
+            spin_loop();
+        }
+    }
+
+    /// 退出当前进程（新调度器版本）
+    #[cfg(feature = "sched_new")]
+    pub fn exit(exit_code: usize) -> ! {
+        // 检查是否是init进程尝试退出，如果是则产生panic
+        let current_pcb = ProcessManager::current_pcb();
+
+        if current_pcb.raw_pid() == RawPid(1) {
+            log::error!(
+                "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+        drop(current_pcb);
+
+        // 关中断
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let pid: Arc<Pid>;
+        let raw_pid = ProcessManager::current_pid();
+        {
+            let pcb = ProcessManager::current_pcb();
+            pid = pcb.pid();
+            pcb.wait_queue.mark_dead();
+
+            // 在新调度器中标记为已退出
+            pcb.sched_entity().mark_exited();
+
+            // 进行进程退出后的工作
+            let thread = pcb.thread.write_irqsave();
+
+            if let Some(addr) = thread.clear_child_tid {
+                unsafe {
+                    clear_user_protected(addr, core::mem::size_of::<i32>())
+                        .expect("clear tid failed")
+                };
+                if Arc::strong_count(&pcb.basic().user_vm().expect("User VM Not found")) > 1 {
+                    let _ =
+                        Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
+                }
+            }
+            compiler_fence(Ordering::SeqCst);
+
+            RobustListHead::exit_robust_list(pcb.clone());
+            if thread.vfork_done.is_some() {
+                thread.vfork_done.as_ref().unwrap().complete_all();
+            }
+            drop(thread);
+
+            unsafe { pcb.basic_mut().set_user_vm(None) };
+            pcb.exit_files();
+            if let Some(tty) = pcb.sig_info_irqsave().tty() {
+                let mut g = tty.core().contorl_info_irqsave();
+                if g.pgid == Some(pid) {
+                    g.pgid = None;
+                }
+            }
+            pcb.sig_info_mut().set_tty(None);
+
+            // 在最后，调用 exit_notify 之前，设置状态为 Exited
+            pcb.sched_info
+                .inner_lock_write_irqsave()
+                .set_state(ProcessState::Exited(exit_code));
+
+            drop(pcb);
+
+            ProcessManager::exit_notify();
+        }
+
+        // 使用新调度器进行调度
+        crate::sched_new::schedule(crate::sched_new::SchedMode::None);
         error!("raw_pid {raw_pid:?} exited but sched again!");
         #[allow(clippy::empty_loop)]
         loop {
@@ -871,6 +1102,11 @@ pub struct ProcessControlBlock {
 
     /// 与调度相关的信息
     sched_info: ProcessSchedulerInfo,
+
+    /// 新调度子系统的调度实体（与 sched_info 并存，通过 feature flag 切换）
+    #[cfg(feature = "sched_new")]
+    sched_entity: Arc<SchedEntity>,
+
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
@@ -1010,6 +1246,10 @@ impl ProcessControlBlock {
         let pcb = Arc::new_cyclic(|weak| {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
+            // 创建新调度实体
+            #[cfg(feature = "sched_new")]
+            let sched_entity = SchedEntity::new(weak.clone());
+
             let pcb = Self {
                 pid: raw_pid,
                 tgid: raw_pid,
@@ -1023,6 +1263,8 @@ impl ProcessControlBlock {
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
                 worker_private: SpinLock::new(None),
                 sched_info,
+                #[cfg(feature = "sched_new")]
+                sched_entity,
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
@@ -1298,6 +1540,13 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn sched_info(&self) -> &ProcessSchedulerInfo {
         return &self.sched_info;
+    }
+
+    /// 获取新调度子系统的调度实体
+    #[cfg(feature = "sched_new")]
+    #[inline(always)]
+    pub fn sched_entity(&self) -> &Arc<SchedEntity> {
+        &self.sched_entity
     }
 
     pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStackArch> {

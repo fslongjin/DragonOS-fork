@@ -27,6 +27,12 @@ pub fn smp_cpu_manager() -> &'static SmpCpuManager {
     unsafe { SMP_CPU_MANAGER.as_ref().unwrap() }
 }
 
+/// 尝试获取 SMP CPU 管理器，如果未初始化返回 None
+#[inline]
+pub fn try_smp_cpu_manager() -> Option<&'static SmpCpuManager> {
+    unsafe { SMP_CPU_MANAGER.as_ref() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CpuHpState {
     /// 启动阈值
@@ -68,6 +74,12 @@ impl CpuHpCpuState {
     #[allow(dead_code)]
     pub const fn thread(&self) -> &Option<Arc<ProcessControlBlock>> {
         &self.thread
+    }
+
+    /// 检查 CPU 是否 online
+    #[allow(dead_code)]
+    pub fn is_online(&self) -> bool {
+        self.state == CpuHpState::Online
     }
 }
 
@@ -162,6 +174,11 @@ impl SmpCpuManager {
     /// 获取CPU的状态
     pub fn cpuhp_state(&self, cpu_id: ProcessorId) -> &CpuHpCpuState {
         unsafe { self.cpuhp_state.force_get(cpu_id) }
+    }
+
+    /// 检查 CPU 是否 online
+    pub fn is_cpu_online(&self, cpu_id: ProcessorId) -> bool {
+        self.cpuhp_state(cpu_id).is_online()
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -311,6 +328,8 @@ pub fn smp_cpu_manager_init(boot_cpu: ProcessorId) {
 
     unsafe { smp_cpu_manager().set_possible_cpu(boot_cpu, true) };
     unsafe { smp_cpu_manager().set_present_cpu(boot_cpu, true) };
+    // BSP 启动后就是 online 状态
+    smp_cpu_manager().set_online_cpu(boot_cpu, true);
 
     SmpCpuManager::arch_init(boot_cpu);
 }

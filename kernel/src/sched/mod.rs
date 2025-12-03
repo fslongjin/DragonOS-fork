@@ -789,32 +789,42 @@ impl ProcessManager {
 
 /// ## 时钟tick时调用此函数
 pub fn scheduler_tick() {
-    fence(Ordering::SeqCst);
-    // 获取当前CPU索引
-    let cpu_idx = smp_get_processor_id().data() as usize;
-
-    // 获取当前CPU的请求队列
-    let rq = cpu_rq(cpu_idx);
-
-    let (rq, guard) = rq.self_lock();
-
-    // 获取当前请求队列的当前请求
-    let current = rq.current();
-
-    // 更新请求队列时钟
-    rq.update_rq_clock();
-
-    match current.sched_info().policy() {
-        SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
-        SchedPolicy::FIFO => todo!(),
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::IDLE => IdleScheduler::tick(rq, current, false),
+    // 使用新调度器
+    #[cfg(feature = "sched_new")]
+    {
+        crate::sched_new::sched_tick();
+        return;
     }
 
-    rq.calculate_global_load_tick();
+    #[cfg(not(feature = "sched_new"))]
+    {
+        fence(Ordering::SeqCst);
+        // 获取当前CPU索引
+        let cpu_idx = smp_get_processor_id().data() as usize;
 
-    drop(guard);
-    // TODO:处理负载均衡
+        // 获取当前CPU的请求队列
+        let rq = cpu_rq(cpu_idx);
+
+        let (rq, guard) = rq.self_lock();
+
+        // 获取当前请求队列的当前请求
+        let current = rq.current();
+
+        // 更新请求队列时钟
+        rq.update_rq_clock();
+
+        match current.sched_info().policy() {
+            SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
+            SchedPolicy::FIFO => todo!(),
+            SchedPolicy::RT => todo!(),
+            SchedPolicy::IDLE => IdleScheduler::tick(rq, current, false),
+        }
+
+        rq.calculate_global_load_tick();
+
+        drop(guard);
+        // TODO:处理负载均衡
+    }
 }
 
 /// ## 执行调度
@@ -823,6 +833,20 @@ pub fn scheduler_tick() {
 pub fn schedule(sched_mod: SchedMode) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
+
+    // 使用新调度器
+    #[cfg(feature = "sched_new")]
+    {
+        let mode = if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
+            crate::sched_new::SchedMode::Preempt
+        } else {
+            crate::sched_new::SchedMode::None
+        };
+        crate::sched_new::schedule(mode);
+        return;
+    }
+
+    #[cfg(not(feature = "sched_new"))]
     __schedule(sched_mod);
 }
 
@@ -830,6 +854,25 @@ pub fn schedule(sched_mod: SchedMode) {
 /// 此函数与schedule的区别为，该函数不会检查preempt_count
 /// 适用于时钟中断等场景
 pub fn __schedule(sched_mod: SchedMode) {
+    // 使用新调度器
+    #[cfg(feature = "sched_new")]
+    {
+        let mode = if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
+            crate::sched_new::SchedMode::Preempt
+        } else {
+            crate::sched_new::SchedMode::None
+        };
+        crate::sched_new::do_schedule(mode);
+        return;
+    }
+
+    #[cfg(not(feature = "sched_new"))]
+    __schedule_old(sched_mod);
+}
+
+/// 旧调度器的调度实现
+#[cfg(not(feature = "sched_new"))]
+fn __schedule_old(sched_mod: SchedMode) {
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };

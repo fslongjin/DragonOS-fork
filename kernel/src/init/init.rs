@@ -81,6 +81,8 @@ fn do_start_kernel() {
 
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
+    #[cfg(feature = "sched_new")]
+    crate::sched_new::sched_init();
     process_init();
     early_smp_init().expect("early smp init failed");
     irq_init().expect("irq init failed");

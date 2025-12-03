@@ -39,10 +39,14 @@ impl Drop for PanicGuard {
 #[cfg(target_os = "none")]
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
+    use crate::smp::core::smp_get_processor_id;
+
     PANIC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let cpuid = smp_get_processor_id();
     error!(
-        "Kernel Panic Occurred. raw_pid: {}",
-        process::ProcessManager::current_pid().data()
+        "Kernel Panic Occurred. raw_pid: {}, CPU: {}",
+        process::ProcessManager::current_pid().data(),
+        cpuid.data()
     );
 
     match info.location() {

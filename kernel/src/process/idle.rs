@@ -12,6 +12,9 @@ use crate::{
     smp::cpu::ProcessorId,
 };
 
+#[cfg(feature = "sched_new")]
+use crate::sched_new;
+
 use super::{ProcessControlBlock, ProcessManager};
 
 static mut __IDLE_PCB: Option<Vec<Arc<ProcessControlBlock>>> = None;
@@ -75,6 +78,20 @@ impl ProcessManager {
                 .sched_entity()
                 .force_mut()
                 .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+
+            // 注册到新调度器
+            #[cfg(feature = "sched_new")]
+            {
+                let cpu = ProcessorId::new(i);
+                // 设置 idle 进程的调度实体为 IDLE 类型
+                let entity = idle_pcb.sched_entity().clone();
+                // 标记为 IDLE 任务（时间片设为 u64::MAX）
+                entity.set_slice(u64::MAX);
+                entity.set_cpu(i);
+                entity.set_on_rq(true);
+                // 注册到新调度器的 IDLE 队列
+                sched_new::set_idle_task(cpu, entity);
+            }
 
             v.push(idle_pcb);
         }

@@ -12,6 +12,9 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
+#[cfg(feature = "sched_new")]
+use crate::sched_new::SchedState;
+
 use super::{
     mutex::MutexGuard,
     spinlock::{SpinLock, SpinLockGuard},
@@ -72,6 +75,10 @@ impl WaitQueue {
 
         writer.set_state(ProcessState::Runnable);
         writer.set_wakeup();
+
+        // 同时设置 SchedEntity 的状态为 Runnable（新调度器需要）
+        #[cfg(feature = "sched_new")]
+        pcb.sched_entity().mark_runnable();
 
         guard.wait_list.retain(|x| !Arc::ptr_eq(x, &pcb));
         drop(guard);
@@ -263,6 +270,7 @@ impl WaitQueue {
     ///
     /// @return true 成功唤醒进程
     /// @return false 没有唤醒进程
+    #[cfg(not(feature = "sched_new"))]
     pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
         // 如果队列为空，则返回
@@ -289,9 +297,50 @@ impl WaitQueue {
         return res;
     }
 
+    /// @brief 唤醒在队列中等待的第一个进程（新调度器版本）。
+    ///
+    /// 以 SchedEntity 的 SchedState 为准进行判断。
+    /// 传入的 ProcessState 会被转换为对应的 SchedState 进行匹配：
+    /// - ProcessState::Blocked(true) -> SchedState::Interruptible
+    /// - ProcessState::Blocked(false) -> SchedState::Uninterruptible
+    /// - None -> 不进行状态过滤
+    ///
+    /// @return true 成功唤醒进程
+    /// @return false 没有唤醒进程
+    #[cfg(feature = "sched_new")]
+    pub fn wakeup(&self, state: Option<ProcessState>) -> bool {
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
+        // 如果队列为空，则返回
+        if guard.wait_list.is_empty() {
+            return false;
+        }
+
+        // 将 ProcessState 转换为 SchedState 进行匹配
+        let target_sched_state = state.map(|s| match s {
+            ProcessState::Blocked(true) => SchedState::Interruptible,
+            ProcessState::Blocked(false) => SchedState::Uninterruptible,
+            _ => SchedState::Interruptible, // 其他状态默认按可中断处理
+        });
+
+        // 以 SchedState 为准判断是否可以唤醒
+        if let Some(target_state) = target_sched_state {
+            let front_pcb = guard.wait_list.front().unwrap();
+            let sched_state = front_pcb.sched_entity().state();
+            if sched_state != target_state {
+                return false;
+            }
+        }
+
+        let to_wakeup = guard.wait_list.pop_front().unwrap();
+        drop(guard);
+        let res = ProcessManager::wakeup(&to_wakeup).is_ok();
+        return res;
+    }
+
     /// @brief 唤醒在队列中，符合条件的所有进程。
     ///
     /// @param state 用于判断的state，如果一个进程与这个state相同，或者为None(表示不进行这个判断)，则唤醒这个进程。
+    #[cfg(not(feature = "sched_new"))]
     pub fn wakeup_all(&self, state: Option<ProcessState>) {
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
         // 如果队列为空，则返回
@@ -305,6 +354,57 @@ impl WaitQueue {
             let mut wake = false;
             if let Some(state) = state {
                 if to_wakeup.sched_info().inner_lock_read_irqsave().state() == state {
+                    wake = true;
+                }
+            } else {
+                wake = true;
+            }
+
+            if wake {
+                ProcessManager::wakeup(&to_wakeup).unwrap_or_else(|e| {
+                    log::debug!("wakeup pid: {:?} error: {:?}", to_wakeup.raw_pid(), e);
+                });
+                continue;
+            } else {
+                to_push_back.push(to_wakeup);
+            }
+        }
+
+        for to_wakeup in to_push_back {
+            guard.wait_list.push_back(to_wakeup);
+        }
+    }
+
+    /// @brief 唤醒在队列中，符合条件的所有进程（新调度器版本）。
+    ///
+    /// 以 SchedEntity 的 SchedState 为准进行判断。
+    /// 传入的 ProcessState 会被转换为对应的 SchedState 进行匹配：
+    /// - ProcessState::Blocked(true) -> SchedState::Interruptible
+    /// - ProcessState::Blocked(false) -> SchedState::Uninterruptible
+    /// - None -> 不进行状态过滤
+    #[cfg(feature = "sched_new")]
+    pub fn wakeup_all(&self, state: Option<ProcessState>) {
+        let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
+        // 如果队列为空，则返回
+        if guard.wait_list.is_empty() {
+            return;
+        }
+
+        // 将 ProcessState 转换为 SchedState 进行匹配
+        let target_sched_state = state.map(|s| match s {
+            ProcessState::Blocked(true) => SchedState::Interruptible,
+            ProcessState::Blocked(false) => SchedState::Uninterruptible,
+            _ => SchedState::Interruptible, // 其他状态默认按可中断处理
+        });
+
+        let mut to_push_back: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        while let Some(to_wakeup) = guard.wait_list.pop_front() {
+            let mut wake = false;
+
+            if let Some(target_state) = target_sched_state {
+                // 以 SchedState 为准进行判断
+                let sched_state = to_wakeup.sched_entity().state();
+                if sched_state == target_state {
                     wake = true;
                 }
             } else {
