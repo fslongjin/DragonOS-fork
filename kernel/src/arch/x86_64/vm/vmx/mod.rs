@@ -386,7 +386,7 @@ impl VmxKvmFunc {
 
     pub fn loaded_vmcs_clear(loaded_vmcs: &Arc<LockedLoadedVmcs>) {
         let mut guard = loaded_vmcs.lock();
-        if guard.cpu == ProcessorId::INVALID {
+        if guard.cpu == ProcessorId::NONE {
             return;
         }
 
@@ -407,7 +407,7 @@ impl VmxKvmFunc {
 
             let _ = current_loaded_vmcs_list_mut().extract_if(|x| Arc::ptr_eq(x, loaded_vmcs));
 
-            guard.cpu = ProcessorId::INVALID;
+            guard.cpu = ProcessorId::NONE;
             guard.launched = false;
         } else {
             // 交由对应cpu处理

@@ -17,7 +17,7 @@ use super::{core::smp_get_processor_id, SMPArch};
 int_like!(ProcessorId, AtomicProcessorId, u32, AtomicU32);
 
 impl ProcessorId {
-    pub const INVALID: ProcessorId = ProcessorId::new(u32::MAX);
+    pub const NONE: ProcessorId = ProcessorId::new(u32::MAX);
 }
 
 static mut SMP_CPU_MANAGER: Option<SmpCpuManager> = None;
@@ -278,7 +278,10 @@ impl SmpCpuManager {
 
     fn do_cpuhp_kick_ap(&self, cpu_state: &mut CpuHpCpuState) -> Result<(), SystemError> {
         let pcb = cpu_state.thread.as_ref().ok_or(SystemError::EINVAL)?;
-        let cpu_id = pcb.sched_info().on_cpu().ok_or(SystemError::EINVAL)?;
+        let cpu_id = pcb.sched_info().on_cpu();
+        if cpu_id == ProcessorId::NONE {
+            return Err(SystemError::EINVAL);
+        }
 
         // todo: 等待CPU启动完成
 

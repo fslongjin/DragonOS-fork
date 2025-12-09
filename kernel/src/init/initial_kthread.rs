@@ -117,7 +117,6 @@ fn switch_to_user() -> ! {
     current_pcb.flags().remove(ProcessFlags::KTHREAD);
     current_pcb.worker_private().take();
 
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
     drop(current_pcb);
 
     let mut proc_init_info = ProcInitInfo::new("");

@@ -234,8 +234,6 @@ impl ProcessManager {
             )
         });
 
-        pcb.sched_info().set_on_cpu(Some(smp_get_processor_id()));
-
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",

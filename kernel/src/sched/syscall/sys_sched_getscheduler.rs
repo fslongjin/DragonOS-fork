@@ -4,7 +4,7 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_GETSCHEDULER;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
-use crate::sched::SchedPolicy;
+use crate::sched::OldSchedPolicy;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use alloc::string::ToString;
@@ -77,7 +77,7 @@ impl Syscall for SysSchedGetscheduler {
         }
 
         // 获取调度策略
-        let policy = *target_pcb.sched_info().sched_policy.read_irqsave();
+        let policy = target_pcb.sched_info().policy();
 
         // 将 DragonOS 的 SchedPolicy 映射到 Linux 的调度策略值
         // Linux 调度策略值：
@@ -88,10 +88,10 @@ impl Syscall for SysSchedGetscheduler {
         // - SCHED_IDLE = 5
         // - SCHED_DEADLINE = 6 (DragonOS 暂不支持)
         let linux_policy = match policy {
-            SchedPolicy::CFS => PosixLinuxSchedPolicy::Other,
-            SchedPolicy::FIFO => PosixLinuxSchedPolicy::Fifo,
-            SchedPolicy::RT => PosixLinuxSchedPolicy::Rr, // RT 策略映射到 SCHED_RR
-            SchedPolicy::IDLE => PosixLinuxSchedPolicy::Idle,
+            OldSchedPolicy::CFS => PosixLinuxSchedPolicy::Other,
+            OldSchedPolicy::FIFO => PosixLinuxSchedPolicy::Fifo,
+            OldSchedPolicy::RT => PosixLinuxSchedPolicy::Rr, // RT 策略映射到 SCHED_RR
+            OldSchedPolicy::IDLE => PosixLinuxSchedPolicy::Idle,
         };
 
         Ok(linux_policy as i32 as usize)

@@ -293,17 +293,14 @@ impl ProcFSInode {
                 .to_owned(),
         );
 
-        let sched_info_guard = pcb.sched_info();
-        let state = sched_info_guard.inner_lock_read_irqsave().state();
-        let cpu_id = sched_info_guard
-            .on_cpu()
-            .map(|cpu| cpu.data() as i32)
-            .unwrap_or(-1);
+        let sched_info = pcb.sched_info();
+        let state = sched_info.sched_entity().state();
+        let cpu_id = sched_info.on_cpu().data(); 
 
-        let priority = sched_info_guard.policy();
-        let vrtime = sched_info_guard.sched_entity.vruntime;
-        let time = sched_info_guard.sched_entity.sum_exec_runtime;
-        let start_time = sched_info_guard.sched_entity.exec_start;
+        let priority = sched_info.policy();
+        let vrtime = 0;
+        let time = 0;
+        let start_time = 0;
         // State
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
@@ -336,7 +333,7 @@ impl ProcFSInode {
         );
 
         // fdsize
-        if matches!(state, ProcessState::Exited(_)) {
+        if state.is_exited() {
             // 进程已经退出，fdsize为0
             pdata.append(&mut format!("\nFDSize:\t{}", 0).into());
         } else {

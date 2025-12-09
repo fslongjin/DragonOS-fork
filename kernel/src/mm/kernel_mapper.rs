@@ -21,7 +21,7 @@ use core::{
 
 /// 标志当前没有处理器持有内核映射器的锁
 /// 之所以需要这个标志，是因为 AtomicProcessorId::new(0) 会把0当作一个处理器的id
-const KERNEL_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::INVALID;
+const KERNEL_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::NONE;
 /// 当前持有内核映射器锁的处理器
 static KERNEL_MAPPER_LOCK_OWNER: AtomicProcessorId =
     AtomicProcessorId::new(KERNEL_MAPPER_NO_PROCESSOR);

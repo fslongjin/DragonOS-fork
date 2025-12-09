@@ -253,7 +253,7 @@ impl Signal {
 
         // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
         // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
+        let state = pcb.sched_info().sched_entity().state();
         let is_blocked_interruptable = state.is_blocked_interruptable();
         let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
 
@@ -298,13 +298,13 @@ impl Signal {
         }
 
         // 以 SchedState 为准判断是否处于可中断睡眠
-        let sched_state = pcb.sched_entity().state();
-        let is_interruptible = sched_state == SchedState::Interruptible;
+        let sched_state = pcb.sched_info().sched_entity().state();
+       
         let has_restore_sig_mask = pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK);
 
         // 若线程正处于可中断阻塞，且当前在 set_user_sigmask 语义下（如 rt_sigtimedwait/pselect 等）
         // 则无论该信号是否在常规 blocked 集内，都应唤醒，由具体系统调用在返回路径上判定。
-        if is_interruptible && has_restore_sig_mask {
+        if sched_state.is_interruptible() && has_restore_sig_mask {
             return true;
         }
 
@@ -378,7 +378,7 @@ impl Signal {
 
             // 仅当确实处于 job-control stopped 时，才报告 continued 事件并通知父进程
             let was_stopped = {
-                let state = pcb.sched_info().inner_lock_read_irqsave().state();
+                let state = pcb.sched_info().sched_entity().state();
                 state.is_stopped()
                     || pcb.sighand().flags_contains(SignalFlags::STOP_STOPPED)
                     || pcb.sighand().flags_contains(SignalFlags::CLD_STOPPED)
@@ -430,7 +430,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
     // 如果不是 fatal 的就只唤醒 stop 的进程来响应
     // debug!("signal_wake_up");
     // 如果目标进程已经在运行，则发起一个ipi，使得它陷入内核
-    let state = pcb.sched_info().inner_lock_read_irqsave().state();
+    let state = pcb.sched_info().sched_entity().state();
     let mut wakeup_ok = true;
     if state.is_blocked_interruptable() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
@@ -474,18 +474,13 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
 #[cfg(feature = "sched_new")]
 #[inline]
 fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
-    use crate::sched_new::SchedState;
-    use crate::process::ProcessState;
-
     // 以 SchedState 为准判断
-    let sched_state = pcb.sched_entity().state();
-    // 同时获取 ProcessState 用于检查 Stopped 状态（作业控制语义）
-    let process_state = pcb.sched_info().inner_lock_read_irqsave().state();
+    let sched_state = pcb.sched_info().sched_entity().state();
 
     let mut wakeup_ok = true;
 
     // 可中断睡眠状态可以被信号唤醒
-    if sched_state == SchedState::Interruptible {
+    if sched_state.is_interruptible() {
         ProcessManager::wakeup(&pcb).unwrap_or_else(|e| {
             wakeup_ok = false;
             warn!(
@@ -495,7 +490,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
                 e
             );
         });
-    } else if process_state.is_stopped() {
+    } else if sched_state.is_stopped() {
         // 对已处于 Stopped 的任务，除非致命信号，否则不要唤醒为 Runnable
         // SIGCONT 的唤醒在 prepare_signal(SIGCONT) 路径专门处理
         wakeup_ok = false;
@@ -511,7 +506,7 @@ fn signal_wake_up(pcb: Arc<ProcessControlBlock>, fatal: bool) {
         let _r = ProcessManager::wakeup(&pcb).map(|_| {
             ProcessManager::kick(&pcb);
         });
-    } else if !process_state.is_stopped() {
+    } else if !sched_state.is_stopped() {
         ProcessManager::kick(&pcb);
     }
 }

@@ -37,6 +37,11 @@ impl Default for RoundRobinClassRq {
 
 impl SchedClassRq for RoundRobinClassRq {
     fn enqueue(&mut self, entity: Arc<SchedEntity>, _flags: EnqueueFlags) {
+        // 已退出的任务不可再入队
+        if entity.state().is_exited() {
+            return;
+        }
+
         // 避免重复入队
         if self.contains(&entity) {
             return;
@@ -44,6 +49,7 @@ impl SchedClassRq for RoundRobinClassRq {
 
         // 重置时间片
         entity.reset_slice();
+        entity.set_on_rq(true);
 
         // 加入队尾
         self.queue.push_back(entity);
@@ -52,23 +58,23 @@ impl SchedClassRq for RoundRobinClassRq {
     fn dequeue(&mut self, entity: &Arc<SchedEntity>) {
         // 从队列中移除
         self.queue.retain(|e| !Arc::ptr_eq(e, entity));
+        entity.set_on_rq(false);
     }
 
     fn pick_next(&mut self) -> Option<Arc<SchedEntity>> {
-        // 从队首取出
-        let entity = self.queue.pop_front()?;
-        
-        // 调试：检查是否选中了退出的任务
-        if entity.state().is_exited() {
-            let pid = entity.pcb().map(|p| p.raw_pid().data()).unwrap_or(9999);
-            log::error!(
-                "RR pick_next: selected EXITED task! pid={} queue_len={}",
-                pid,
-                self.queue.len()
-            );
+        // 过滤已退出的任务，直到找到可运行的实体
+        while let Some(entity) = self.queue.pop_front() {
+            if entity.state().is_exited() {
+                let pid = entity.pcb().map(|p| p.raw_pid().data()).unwrap_or(9999);
+                log::warn!("RR pick_next: drop EXITED task pid={} queue_len={}", pid, self.queue.len());
+                entity.set_on_rq(false);
+                continue;
+            }
+            entity.set_on_rq(false);
+            return Some(entity);
         }
-        
-        Some(entity)
+
+        None
     }
 
     fn put_prev(&mut self, entity: Arc<SchedEntity>) {
@@ -77,7 +83,10 @@ impl SchedClassRq for RoundRobinClassRq {
         if !self.contains(&entity) && entity.state().is_runnable() {
             // 重置时间片
             entity.reset_slice();
+            entity.set_on_rq(true);
             self.queue.push_back(entity);
+        } else {
+            entity.set_on_rq(false);
         }
     }
 

@@ -157,7 +157,7 @@ impl X86VcpuArch {
     #[inline(never)]
     pub fn new() -> Self {
         let mut ret: Box<X86VcpuArch> = unsafe { Box::new_zeroed().assume_init() };
-        ret.last_vmentry_cpu = ProcessorId::INVALID;
+        ret.last_vmentry_cpu = ProcessorId::NONE;
         ret.regs_avail = AllocBitmap::new(32);
         ret.regs_dirty = AllocBitmap::new(32);
         ret.mp_state = MutilProcessorState::Runnable;
@@ -609,7 +609,7 @@ impl VirtCpu {
         //kvm_arch_vcpu_create
         vm.vcpu_precreate(id)?;
 
-        self.arch.last_vmentry_cpu = ProcessorId::INVALID;
+        self.arch.last_vmentry_cpu = ProcessorId::NONE;
         self.arch.regs_avail.set_all(true);
         self.arch.regs_dirty.set_all(true);
 

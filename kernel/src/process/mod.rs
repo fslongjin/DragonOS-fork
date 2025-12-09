@@ -4,7 +4,9 @@ use core::{
     hint::spin_loop,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{
+        compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    },
 };
 
 use alloc::{
@@ -56,11 +58,15 @@ use crate::{
         ucontext::AddressSpace,
         PhysAddr, VirtAddr,
     },
-    process::resource::{RLimit64, RLimitID},
-    sched::{
-        DequeueFlag, EnqueueFlag, OnRq, SchedMode, WakeupFlags, __schedule, completion::Completion,
-        cpu_rq, fair::FairSchedEntity, prio::MAX_PRIO,
+    process::{
+        preempt::PreemptGuard,
+        resource::{RLimit64, RLimitID},
     },
+    sched::{
+        DequeueFlag, EnqueueFlag, OldSchedPolicy, OnRq, SchedMode, WakeupFlags, __schedule,
+        completion::Completion, prio::MAX_PRIO,
+    },
+    sched_new::{cpu_rq, LocalRunQueue},
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
@@ -70,7 +76,7 @@ use crate::{
 };
 
 #[cfg(feature = "sched_new")]
-use crate::sched_new::{SchedEntity, SchedState};
+use crate::sched_new::{force_switch_to_idle, SchedEntity, SchedState};
 use timer::AlarmTimer;
 
 use self::{cred::Cred, kthread::WorkerPrivate};
@@ -232,66 +238,13 @@ impl ProcessManager {
         pids
     }
 
-    /// 唤醒一个进程
-    #[cfg(not(feature = "sched_new"))]
     pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if state.is_blocked() {
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            let state = writer.state();
-            if state.is_blocked() {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
-
-                // avoid deadlock
-                drop(writer);
-
-                let rq =
-                    cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
-
-                let (rq, _guard) = rq.self_lock();
-                rq.update_rq_clock();
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
-
-                // sched_enqueue(pcb.clone(), true);
-                return Ok(());
-            } else if state.is_exited() {
-                return Err(SystemError::EINVAL);
-            } else {
-                return Ok(());
-            }
-        } else if state.is_exited() {
-            return Err(SystemError::EINVAL);
-        } else {
-            return Ok(());
-        }
-    }
-
-    /// 唤醒一个进程（新调度器版本）
-    ///
-    /// 以 SchedEntity 的 SchedState 为准判断是否可唤醒，
-    /// 同时同步更新 ProcessState 以保持兼容性。
-    #[cfg(feature = "sched_new")]
-    pub fn wakeup(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let entity = pcb.sched_entity();
+        let entity = pcb.sched_info().sched_entity();
         let sched_state = entity.state();
 
         // 以 SchedState 为准判断是否可唤醒
         if sched_state.is_wakeable() {
-            // 同步更新 ProcessState
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            writer.set_state(ProcessState::Runnable);
-            writer.set_wakeup();
-            drop(writer);
-
-            // 使用新调度器入队（这会设置 SchedState 为 Runnable）
             crate::sched_new::wakeup(entity);
             return Ok(());
         } else if sched_state.is_exited() {
@@ -305,49 +258,6 @@ impl ProcessManager {
         }
     }
 
-    /// 唤醒暂停的进程
-    #[cfg(not(feature = "sched_new"))]
-    pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let state = pcb.sched_info().inner_lock_read_irqsave().state();
-        if let ProcessState::Stopped = state {
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            let state = writer.state();
-            if let ProcessState::Stopped = state {
-                writer.set_state(ProcessState::Runnable);
-                // avoid deadlock
-                drop(writer);
-
-                let rq = cpu_rq(
-                    pcb.sched_info()
-                        .on_cpu()
-                        .unwrap_or(smp_get_processor_id())
-                        .data() as usize,
-                );
-
-                let (rq, _guard) = rq.self_lock();
-                rq.update_rq_clock();
-                rq.activate_task(
-                    pcb,
-                    EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
-                );
-
-                rq.check_preempt_currnet(pcb, WakeupFlags::empty());
-
-                // sched_enqueue(pcb.clone(), true);
-                return Ok(());
-            } else if state.is_runnable() {
-                return Ok(());
-            } else {
-                return Err(SystemError::EINVAL);
-            }
-        } else if state.is_runnable() {
-            return Ok(());
-        } else {
-            return Err(SystemError::EINVAL);
-        }
-    }
-
     /// 唤醒暂停的进程（新调度器版本）
     ///
     /// 以 SchedEntity 的 SchedState 为准判断是否可唤醒，
@@ -355,17 +265,12 @@ impl ProcessManager {
     #[cfg(feature = "sched_new")]
     pub fn wakeup_stop(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        
-        let entity = pcb.sched_entity();
+
+        let entity = pcb.sched_info().sched_entity();
         let sched_state = entity.state();
 
-        // 检查是否是 Stopped 状态（专门用于作业控制唤醒）
-        if sched_state.is_stop_wakeable() {
-            // 同步更新 ProcessState
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            writer.set_state(ProcessState::Runnable);
-            drop(writer);
-
+        // 检查是否是 Stopped 状态
+        if sched_state.is_stopped() {
             // 唤醒 Stopped 状态的进程
             crate::sched_new::wakeup(entity);
             return Ok(());
@@ -384,84 +289,37 @@ impl ProcessManager {
     ///
     /// 注意：该函数用于对“目标进程”进行停止标记，不要求在目标进程上下文调用。
     /// 与 `mark_stop`（仅当前进程）相对应。
-    ///
-    /// 在新调度器模式下，由于 SchedState 没有 Stopped 状态，
-    /// 我们将 SchedState 设置为 Uninterruptible 以阻止调度，
-    /// 同时保持 ProcessState::Stopped 用于作业控制语义。
     pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        let state = writer.state();
-        if !matches!(state, ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Stopped);
+        let entity = pcb.sched_info().sched_entity();
+        let mut state = entity.state();
+        if !state.is_exited() {
+            entity.mark_stopped();
             pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
-
-            // 在新调度器中，将 SchedState 设置为 Stopped
-            #[cfg(feature = "sched_new")]
-            pcb.sched_entity().mark_stopped();
 
             return Ok(());
         }
         return Err(SystemError::EINTR);
     }
 
-    /// 标志当前进程永久睡眠，但是发起调度的工作，应该由调用者完成
-    ///
-    /// ## 注意
-    ///
-    /// - 进入当前函数之前，不能持有sched_info的锁
-    /// - 进入当前函数之前，必须关闭中断
-    /// - 进入当前函数之后必须保证逻辑的正确性，避免被重复加入调度队列
-    #[cfg(not(feature = "sched_new"))]
+    /// 标志当前进程永久睡眠
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
         );
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-        if !matches!(writer.state(), ProcessState::Exited(_)) {
-            writer.set_state(ProcessState::Blocked(interruptable));
-            writer.set_sleep();
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-            fence(Ordering::SeqCst);
-            drop(writer);
-            return Ok(());
-        }
-        return Err(SystemError::EINTR);
-    }
-
-    /// 标志当前进程永久睡眠（新调度器版本）
-    ///
-    /// 以 SchedState 为准判断是否可以睡眠
-    #[cfg(feature = "sched_new")]
-    pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
-        assert!(
-            !CurrentIrqArch::is_irq_enabled(),
-            "interrupt must be disabled before enter ProcessManager::mark_sleep()"
-        );
-        let pcb = ProcessManager::current_pcb();
-        let entity = pcb.sched_entity();
+        let entity = pcb.sched_info().sched_entity();
         let sched_state = entity.state();
 
-        // 以 SchedState 为准判断是否可以睡眠
         if !sched_state.is_exited() {
-            // 同步更新 ProcessState（保持兼容性）
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            writer.set_state(ProcessState::Blocked(interruptable));
-            writer.set_sleep();
-            drop(writer);
-
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-
             // 设置 SchedState
             if interruptable {
                 entity.mark_interruptible();
             } else {
                 entity.mark_uninterruptible();
             }
-
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
             fence(Ordering::SeqCst);
             return Ok(());
         }
@@ -508,20 +366,14 @@ impl ProcessManager {
         );
 
         let pcb = ProcessManager::current_pcb();
-        let entity = pcb.sched_entity();
+        let entity = pcb.sched_info().sched_entity();
         let sched_state = entity.state();
 
         // 以 SchedState 为准判断是否可以停止
         if !sched_state.is_exited() {
-            // 同步更新 ProcessState（保持兼容性）
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            writer.set_state(ProcessState::Stopped);
-            drop(writer);
-
-            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-
             // 设置 SchedState 为 Stopped
             entity.mark_stopped();
+            pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
 
             return Ok(());
         }
@@ -686,6 +538,7 @@ impl ProcessManager {
     pub fn exit(exit_code: usize) -> ! {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
+        let pcb_for_sched = current_pcb.clone();
 
         if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
@@ -707,8 +560,8 @@ impl ProcessManager {
             pid = pcb.pid();
             pcb.wait_queue.mark_dead();
 
-            // 在新调度器中标记为已退出
-            pcb.sched_entity().mark_exited();
+            // 在调度器中标记为已退出
+            pcb.sched_info().sched_entity().mark_exited();
 
             // 进行进程退出后的工作
             let thread = pcb.thread.write_irqsave();
@@ -741,23 +594,18 @@ impl ProcessManager {
             }
             pcb.sig_info_mut().set_tty(None);
 
-            // 在最后，调用 exit_notify 之前，设置状态为 Exited
-            pcb.sched_info
-                .inner_lock_write_irqsave()
-                .set_state(ProcessState::Exited(exit_code));
+            pcb.set_exit_code(exit_code as u32);
 
             drop(pcb);
 
             ProcessManager::exit_notify();
         }
 
-        // 使用新调度器进行调度
-        crate::sched_new::schedule(crate::sched_new::SchedMode::None);
-        error!("raw_pid {raw_pid:?} exited but sched again!");
-        #[allow(clippy::empty_loop)]
-        loop {
-            spin_loop();
-        }
+        // 直接强制切到当前 CPU 的 idle，不再返回，避免退出任务被再次调度
+        // 在调用前清零 preempt_count，并保持中断关闭状态由 force_switch_to_idle 接管
+        unsafe { pcb_for_sched.set_preempt_count(0); }
+        core::mem::drop(_irq_guard);
+        crate::sched_new::force_switch_to_idle(pcb_for_sched);
     }
 
     /// 线程组整体退出（仿照 Linux do_group_exit 语义）
@@ -890,20 +738,29 @@ impl ProcessManager {
     /// - `pcb` : 进程的pcb
     #[allow(dead_code)]
     pub fn kick(pcb: &Arc<ProcessControlBlock>) {
-        ProcessManager::current_pcb().preempt_disable();
+        let preempt_guard = PreemptGuard::new();
         let cpu_id = pcb.sched_info().on_cpu();
 
-        if let Some(cpu_id) = cpu_id {
+        if cpu_id != ProcessorId::NONE {
             let current_cpu_id = smp_get_processor_id();
             // Do not kick the current CPU, as it is already running and cannot preempt itself.
-            if pcb.raw_pid() == cpu_rq(cpu_id.data() as usize).current().raw_pid()
-                && cpu_id != current_cpu_id
-            {
+
+            if cpu_id != current_cpu_id {
+                let target_pid = cpu_rq(cpu_id)
+                    .lock_irqsave()
+                    .current_pcb()
+                    .map(|p| p.raw_pid());
+                if target_pid.is_none() {
+                    return;
+                }
+                if target_pid.unwrap() != pcb.raw_pid() {
+                    return;
+                }
+
                 kick_cpu(cpu_id).expect("ProcessManager::kick(): Failed to kick cpu");
             }
         }
-
-        ProcessManager::current_pcb().preempt_enable();
+        drop(preempt_guard);
     }
 }
 
@@ -1103,10 +960,6 @@ pub struct ProcessControlBlock {
     /// 与调度相关的信息
     sched_info: ProcessSchedulerInfo,
 
-    /// 新调度子系统的调度实体（与 sched_info 并存，通过 feature flag 切换）
-    #[cfg(feature = "sched_new")]
-    sched_entity: Arc<SchedEntity>,
-
     /// 与处理器架构相关的信息
     arch_info: SpinLock<ArchPCBInfo>,
     /// 与信号处理相关的信息(似乎可以是无锁的)
@@ -1157,6 +1010,8 @@ pub struct ProcessControlBlock {
     executable_path: RwLock<String>,
     /// 资源限制（rlimit）数组
     rlimits: RwLock<[RLimit64; RLimitID::Nlimits as usize]>,
+
+    exit_code: AtomicU32,
 }
 
 impl ProcessControlBlock {
@@ -1236,8 +1091,6 @@ impl ProcessControlBlock {
         let preempt_count = AtomicUsize::new(0);
         let flags = unsafe { LockFreeFlags::new(ProcessFlags::empty()) };
 
-        let sched_info = ProcessSchedulerInfo::new(None);
-
         let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
             .map(|p| Arc::downgrade(&p))
             .unwrap_or_default();
@@ -1246,9 +1099,7 @@ impl ProcessControlBlock {
         let pcb = Arc::new_cyclic(|weak| {
             let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
 
-            // 创建新调度实体
-            #[cfg(feature = "sched_new")]
-            let sched_entity = SchedEntity::new(weak.clone());
+            let sched_info = ProcessSchedulerInfo::new(weak.clone(), is_idle);
 
             let pcb = Self {
                 pid: raw_pid,
@@ -1263,8 +1114,6 @@ impl ProcessControlBlock {
                 syscall_stack: RwLock::new(KernelStack::new().unwrap()),
                 worker_private: SpinLock::new(None),
                 sched_info,
-                #[cfg(feature = "sched_new")]
-                sched_entity,
                 arch_info,
                 sig_info: RwLock::new(ProcessSignalInfo::default()),
                 sighand: RwLock::new(SigHand::new()),
@@ -1286,6 +1135,7 @@ impl ProcessControlBlock {
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
                 rlimits: RwLock::new(Self::default_rlimits()),
+                exit_code: AtomicU32::new(0),
             };
 
             pcb.sig_info.write().set_tty(tty);
@@ -1299,10 +1149,6 @@ impl ProcessControlBlock {
             pcb
         });
 
-        pcb.sched_info()
-            .sched_entity()
-            .force_mut()
-            .set_pcb(Arc::downgrade(&pcb));
         // 设置进程的arc指针到内核栈和系统调用栈的最低地址处
         unsafe {
             pcb.kernel_stack
@@ -1540,13 +1386,6 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn sched_info(&self) -> &ProcessSchedulerInfo {
         return &self.sched_info;
-    }
-
-    /// 获取新调度子系统的调度实体
-    #[cfg(feature = "sched_new")]
-    #[inline(always)]
-    pub fn sched_entity(&self) -> &Arc<SchedEntity> {
-        &self.sched_entity
     }
 
     pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStackArch> {
@@ -1889,17 +1728,15 @@ impl ProcessControlBlock {
     }
 
     pub fn is_exited(&self) -> bool {
-        self.sched_info
-            .inner_lock_read_irqsave()
-            .state()
-            .is_exited()
+        self.sched_info.sched_entity().state().is_exited()
     }
 
-    pub fn exit_code(&self) -> Option<usize> {
-        self.sched_info
-            .inner_lock_read_irqsave()
-            .state()
-            .exit_code()
+    pub fn exit_code(&self) -> u32 {
+        self.exit_code.load(Ordering::SeqCst)
+    }
+
+    pub fn set_exit_code(&self, code: u32) {
+        self.exit_code.store(code, Ordering::SeqCst);
     }
 
     /// 获取进程的namespace代理
@@ -2080,25 +1917,11 @@ impl ProcessBasicInfo {
 
 #[derive(Debug)]
 pub struct ProcessSchedulerInfo {
-    /// 当前进程所在的cpu
-    on_cpu: AtomicProcessorId,
-    /// 如果当前进程等待被迁移到另一个cpu核心上（也就是flags中的PF_NEED_MIGRATE被置位），
-    /// 该字段存储要被迁移到的目标处理器核心号
-    // migrate_to: AtomicProcessorId,
-    inner_locked: RwLock<InnerSchedInfo>,
-    /// 进程的调度优先级
-    // priority: SchedPriority,
-    /// 当前进程的虚拟运行时间
-    // virtual_runtime: AtomicIsize,
-    /// 由实时调度器管理的时间片
-    // rt_time_slice: AtomicIsize,
-    pub sched_stat: RwLock<SchedInfo>,
-    /// 调度策略
-    pub sched_policy: RwLock<crate::sched::SchedPolicy>,
-    /// cfs调度实体
-    pub sched_entity: Arc<FairSchedEntity>,
-    pub on_rq: SpinLock<OnRq>,
-
+    /// 新调度子系统的调度实体（与 sched_info 并存，通过 feature flag 切换）
+    #[cfg(feature = "sched_new")]
+    sched_entity: Arc<SchedEntity>,
+    /// 兼容旧接口，供 syscalls 等读取调度策略（新调度器默认 CFS/IDLE）
+    pub sched_policy: RwLock<OldSchedPolicy>,
     pub prio_data: RwLock<PrioData>,
 }
 
@@ -2165,71 +1988,42 @@ impl InnerSchedInfo {
 
 impl ProcessSchedulerInfo {
     #[inline(never)]
-    pub fn new(on_cpu: Option<ProcessorId>) -> Self {
-        let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
-        return Self {
-            on_cpu: AtomicProcessorId::new(cpu_id),
-            // migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
-            inner_locked: RwLock::new(InnerSchedInfo {
-                state: ProcessState::Blocked(false),
-                sleep: false,
-            }),
-            // virtual_runtime: AtomicIsize::new(0),
-            // rt_time_slice: AtomicIsize::new(0),
-            // priority: SchedPriority::new(100).unwrap(),
-            sched_stat: RwLock::new(SchedInfo::default()),
-            sched_policy: RwLock::new(crate::sched::SchedPolicy::CFS),
-            sched_entity: FairSchedEntity::new(),
-            on_rq: SpinLock::new(OnRq::None),
-            prio_data: RwLock::new(PrioData::default()),
+    pub fn new(pcb_weak: Weak<ProcessControlBlock>, is_idle: bool) -> Self {
+        let sched_policy = if is_idle {
+            OldSchedPolicy::IDLE
+        } else {
+            OldSchedPolicy::CFS
         };
-    }
 
-    pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
-        return self.sched_entity.clone();
-    }
-
-    pub fn on_cpu(&self) -> Option<ProcessorId> {
-        let on_cpu = self.on_cpu.load(Ordering::SeqCst);
-        if on_cpu == ProcessorId::INVALID {
-            return None;
+        #[cfg(feature = "sched_new")]
+        let sched_entity = if is_idle {
+            SchedEntity::new_idle(pcb_weak)
         } else {
-            return Some(on_cpu);
+            SchedEntity::new(pcb_weak)
+        };
+
+        #[cfg(not(feature = "sched_new"))]
+        {
+            // 保持参数已使用，避免未使用警告
+            let _ = pcb_weak;
+        }
+
+        Self {
+            #[cfg(feature = "sched_new")]
+            sched_entity,
+            sched_policy: RwLock::new(sched_policy),
+            prio_data: RwLock::new(PrioData::default()),
         }
     }
 
-    pub fn set_on_cpu(&self, on_cpu: Option<ProcessorId>) {
-        if let Some(cpu_id) = on_cpu {
-            self.on_cpu.store(cpu_id, Ordering::SeqCst);
-        } else {
-            self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
-        }
+    #[cfg(feature = "sched_new")]
+    pub fn sched_entity(&self) -> &Arc<SchedEntity> {
+        return &self.sched_entity;
     }
 
-    // pub fn migrate_to(&self) -> Option<ProcessorId> {
-    //     let migrate_to = self.migrate_to.load(Ordering::SeqCst);
-    //     if migrate_to == ProcessorId::INVALID {
-    //         return None;
-    //     } else {
-    //         return Some(migrate_to);
-    //     }
-    // }
-
-    // pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
-    //     if let Some(data) = migrate_to {
-    //         self.migrate_to.store(data, Ordering::SeqCst);
-    //     } else {
-    //         self.migrate_to
-    //             .store(ProcessorId::INVALID, Ordering::SeqCst)
-    //     }
-    // }
-
-    pub fn inner_lock_write_irqsave(&self) -> RwLockWriteGuard<'_, InnerSchedInfo> {
-        return self.inner_locked.write_irqsave();
-    }
-
-    pub fn inner_lock_read_irqsave(&self) -> RwLockReadGuard<'_, InnerSchedInfo> {
-        return self.inner_locked.read_irqsave();
+    #[cfg(feature = "sched_new")]
+    pub fn on_cpu(&self) -> ProcessorId {
+        self.sched_entity.cpu()
     }
 
     // pub fn inner_lock_try_read_irqsave(
@@ -2282,8 +2076,8 @@ impl ProcessSchedulerInfo {
     //     self.rt_time_slice.fetch_add(delta, Ordering::SeqCst);
     // }
 
-    pub fn policy(&self) -> crate::sched::SchedPolicy {
-        return *self.sched_policy.read_irqsave();
+    pub fn policy(&self) -> crate::sched::OldSchedPolicy {
+        *self.sched_policy.read_irqsave()
     }
 }
 

@@ -34,8 +34,8 @@ pub use entity::{SchedEntity, SchedState};
 pub use idle::IdleClassRq;
 pub use rr::RoundRobinClassRq;
 pub use scheduler::{
-    cpu_rq, do_schedule, sched_enqueue, sched_init, sched_sleep, sched_tick, sched_yield, schedule,
-    scheduler, set_idle_task, wakeup, ClassScheduler, SchedMode,
+    cpu_rq, do_schedule, force_switch_to_idle, sched_enqueue, sched_init, sched_sleep, sched_tick,
+    sched_yield, schedule, scheduler, set_idle_task, wakeup, ClassScheduler, SchedMode,
 };
 
 use alloc::sync::Arc;

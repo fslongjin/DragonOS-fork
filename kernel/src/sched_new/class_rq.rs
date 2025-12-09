@@ -58,25 +58,36 @@ impl PerCpuClassRq {
         self.idle.idle()
     }
 
+    /// 获取 IDLE 任务的拥有权拷贝
+    pub fn idle_entity(&self) -> Option<Arc<SchedEntity>> {
+        self.idle.idle().cloned()
+    }
+
     /// 设置当前运行的任务（用于初始化）
     pub fn set_current(&mut self, entity: Arc<SchedEntity>) {
         entity.mark_running();
-        entity.set_cpu(self.cpu.data());
+        entity.set_cpu(self.cpu);
         self.current = Some(entity);
         self.current_start = clock();
     }
 
+    /// 清除当前运行的任务指针（用于退出等场景）
+    pub fn clear_current(&mut self) {
+        self.current = None;
+    }
+
     /// 根据调度策略选择对应的调度类队列
     fn get_policy(entity: &SchedEntity) -> SchedPolicy {
-        if entity.is_idle() {
-            SchedPolicy::Idle
-        } else {
-            SchedPolicy::RoundRobin
-        }
+        entity.policy()
     }
 
     /// 将任务入队到对应的调度类
     fn enqueue_entity_internal(&mut self, entity: Arc<SchedEntity>, flags: EnqueueFlags) {
+        // 已退出的任务不应再入队
+        if entity.state().is_exited() {
+            return;
+        }
+
         let policy = Self::get_policy(&entity);
         match policy {
             SchedPolicy::RoundRobin => {
@@ -106,13 +117,32 @@ impl PerCpuClassRq {
 
     /// 选择下一个任务（按优先级：RR -> IDLE）
     fn pick_next_entity(&mut self) -> Option<Arc<SchedEntity>> {
-        // 1. 优先从 RR 队列选择
-        if let Some(entity) = self.rr.pick_next() {
-            return Some(entity);
-        }
+        loop {
+            // 1. 优先从 RR 队列选择
+            if let Some(entity) = self.rr.pick_next() {
+                // 丢弃已退出或已失效的任务
+                if entity.state().is_exited() || entity.pcb().is_none() {
+                    self.nr_running = self.nr_running.saturating_sub(1);
+                    continue;
+                }
+                self.nr_running = self.nr_running.saturating_sub(1);
+                return Some(entity);
+            }
 
-        // 2. 没有普通任务，返回 IDLE
-        self.idle.pick_next()
+            // 2. 没有普通任务，返回 IDLE（若存在）
+            if let Some(idle) = self.idle.pick_next() {
+                return Some(idle);
+            }
+
+            // 未设置 IDLE 的异常情况
+            log::error!("sched_new: no idle task available on cpu {:?}", self.cpu);
+            return None;
+        }
+    }
+
+    /// 供调度器在特殊情形下直接重选下一个任务（同 pick_next_entity）
+    pub fn pick_next_direct(&mut self) -> Option<Arc<SchedEntity>> {
+        self.pick_next_entity()
     }
 
     /// 将当前任务放回对应的调度类队列
@@ -204,7 +234,7 @@ impl LocalRunQueue for PerCpuClassRq {
 
         // 3. 设置新的当前任务
         next.mark_running();
-        next.set_cpu(self.cpu.data());
+        next.set_cpu(self.cpu);
         self.current = Some(next.clone());
         self.current_start = clock();
 
@@ -225,7 +255,7 @@ impl LocalRunQueue for PerCpuClassRq {
 
     fn enqueue(&mut self, entity: Arc<SchedEntity>, flags: EnqueueFlags) {
         entity.set_on_rq(true);
-        entity.set_cpu(self.cpu.data());
+        entity.set_cpu(self.cpu);
         self.enqueue_entity_internal(entity, flags);
     }
 

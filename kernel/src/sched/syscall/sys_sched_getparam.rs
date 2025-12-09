@@ -6,7 +6,7 @@ use crate::process::ProcessManager;
 use crate::process::RawPid;
 use crate::sched::prio::PrioUtil;
 use crate::sched::prio::MAX_RT_PRIO;
-use crate::sched::SchedPolicy;
+use crate::sched::OldSchedPolicy;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;
@@ -78,7 +78,7 @@ impl Syscall for SysSchedGetparam {
         }
 
         // 获取调度策略和优先级
-        let policy = *target_pcb.sched_info().sched_policy.read_irqsave();
+        let policy = target_pcb.sched_info().policy();
         let prio_data = target_pcb.sched_info().prio_data.read_irqsave();
         let prio = prio_data.prio;
 
@@ -91,11 +91,11 @@ impl Syscall for SysSchedGetparam {
         // - 转换公式：sched_priority = MAX_RT_PRIO (100) - prio
         //   但需要限制在 1-99 范围内（因为 prio=0 时 sched_priority=100，需要限制为 99）
         let sched_priority = match policy {
-            SchedPolicy::CFS | SchedPolicy::IDLE => {
+            OldSchedPolicy::CFS | OldSchedPolicy::IDLE => {
                 // 普通进程的 sched_priority 始终为 0
                 0
             }
-            SchedPolicy::RT | SchedPolicy::FIFO => {
+            OldSchedPolicy::RT | OldSchedPolicy::FIFO => {
                 // 检查是否为有效的实时优先级
                 // 实时进程的 prio 应该在 0-99 范围内（prio < MAX_RT_PRIO）
                 if !PrioUtil::rt_prio(prio) {

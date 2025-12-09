@@ -334,7 +334,7 @@ impl LockedLoadedVmcs {
             inner: SpinLock::new(LoadedVmcs {
                 vmcs,
                 shadow_vmcs: None,
-                cpu: ProcessorId::INVALID,
+                cpu: ProcessorId::NONE,
                 launched: false,
                 hv_timer_soft_disabled: false,
                 msr_bitmap: bitmap,

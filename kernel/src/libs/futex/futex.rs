@@ -322,6 +322,18 @@ impl Futex {
         drop(irq_guard);
         schedule(SchedMode::SM_NONE);
 
+        // 调试：若被唤醒时当前任务已退出，记录一次日志便于定位
+        #[cfg(feature = "sched_new")]
+        {
+            let pcb = ProcessManager::current_pcb();
+            if pcb.sched_info().sched_entity().state().is_exited() {
+                log::error!(
+                    "futex_wait: woke with exited entity pid={}",
+                    pcb.raw_pid().data()
+                );
+            }
+        }
+
         // ========== 被唤醒后的检查 ==========
         // 进程被唤醒可能有以下几种情况：
         // 1. futex_wake 显式唤醒（正常情况）- futex_q 已从队列移除

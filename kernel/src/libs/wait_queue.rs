@@ -70,19 +70,13 @@ impl WaitQueue {
 
     pub fn finish_wait(&self) {
         let pcb = ProcessManager::current_pcb();
-        let mut writer = pcb.sched_info().inner_lock_write_irqsave();
         let mut guard: SpinLockGuard<InnerWaitQueue> = self.inner_irqsave();
 
-        writer.set_state(ProcessState::Runnable);
-        writer.set_wakeup();
 
-        // 同时设置 SchedEntity 的状态为 Runnable（新调度器需要）
-        #[cfg(feature = "sched_new")]
-        pcb.sched_entity().mark_runnable();
+        pcb.sched_info().sched_entity().mark_runnable();
 
         guard.wait_list.retain(|x| !Arc::ptr_eq(x, &pcb));
         drop(guard);
-        drop(writer);
     }
 
     /// @brief 让当前进程在等待队列上进行等待，并且，允许被信号打断
@@ -325,7 +319,7 @@ impl WaitQueue {
         // 以 SchedState 为准判断是否可以唤醒
         if let Some(target_state) = target_sched_state {
             let front_pcb = guard.wait_list.front().unwrap();
-            let sched_state = front_pcb.sched_entity().state();
+            let sched_state = front_pcb.sched_info().sched_entity().state();
             if sched_state != target_state {
                 return false;
             }
@@ -403,7 +397,7 @@ impl WaitQueue {
 
             if let Some(target_state) = target_sched_state {
                 // 以 SchedState 为准进行判断
-                let sched_state = to_wakeup.sched_entity().state();
+                let sched_state = to_wakeup.sched_info().sched_entity().state();
                 if sched_state == target_state {
                     wake = true;
                 }

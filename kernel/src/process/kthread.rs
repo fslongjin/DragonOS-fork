@@ -405,8 +405,9 @@ impl KernelThreadMechanism {
         // 忙等目标内核线程退出
         // todo: 使用completion机制优化这里
         loop {
-            if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
-                return Ok(code);
+            if pcb.sched_info().sched_entity().state().is_exited() {
+                let code = pcb.exit_code();
+                return Ok(code.try_into().unwrap());
             }
             spin_loop();
         }

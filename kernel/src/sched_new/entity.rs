@@ -6,7 +6,8 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-use crate::process::ProcessControlBlock;
+use crate::{process::ProcessControlBlock, smp::cpu::ProcessorId};
+use super::SchedPolicy;
 
 /// 调度状态
 #[repr(u8)]
@@ -48,16 +49,18 @@ impl SchedState {
         )
     }
 
-    /// 是否可以被 SIGCONT 唤醒（仅 Stopped 状态）
-    pub fn is_stop_wakeable(&self) -> bool {
-        matches!(self, SchedState::Stopped)
+    pub fn is_interruptible(&self) -> bool {
+        matches!(self, SchedState::Interruptible)
     }
 
+    pub fn is_uninterruptible(&self) -> bool {
+        matches!(self, SchedState::Uninterruptible)
+    }
     /// 是否正在睡眠（包括 Stopped）
     pub fn is_sleeping(&self) -> bool {
         matches!(
             self,
-            SchedState::Interruptible | SchedState::Uninterruptible | SchedState::Stopped
+            SchedState::Interruptible | SchedState::Uninterruptible
         )
     }
 
@@ -96,6 +99,8 @@ impl Default for SchedState {
 pub struct SchedEntity {
     /// 调度状态（原子操作）
     state: AtomicU8,
+    /// 调度策略（RR / Idle）
+    policy: AtomicU8,
 
     /// 当前/最近运行的 CPU（u32::MAX 表示未绑定）
     cpu: AtomicU32,
@@ -113,9 +118,6 @@ pub struct SchedEntity {
     on_rq: AtomicU8,
 }
 
-/// CPU ID 未绑定的标记值
-pub const CPU_ID_NONE: u32 = u32::MAX;
-
 impl SchedEntity {
     /// 默认时间片：10ms (纳秒)
     pub const DEFAULT_SLICE_NS: u64 = 10_000_000;
@@ -128,7 +130,8 @@ impl SchedEntity {
         Arc::new(Self {
             // 初始状态设为 Uninterruptible，这样 wakeup 可以正常工作
             state: AtomicU8::new(SchedState::Uninterruptible as u8),
-            cpu: AtomicU32::new(CPU_ID_NONE),
+            policy: AtomicU8::new(SchedPolicy::RoundRobin as u8),
+            cpu: AtomicU32::new(ProcessorId::NONE.data()),
             slice: AtomicU64::new(Self::DEFAULT_SLICE_NS),
             runtime: AtomicU64::new(0),
             pcb,
@@ -137,10 +140,11 @@ impl SchedEntity {
     }
 
     /// 创建 IDLE 任务的调度实体
-    pub fn new_idle(pcb: Weak<ProcessControlBlock>, cpu: u32) -> Arc<Self> {
+    pub fn new_idle(pcb: Weak<ProcessControlBlock>) -> Arc<Self> {
         Arc::new(Self {
             state: AtomicU8::new(SchedState::Runnable as u8),
-            cpu: AtomicU32::new(cpu),
+            policy: AtomicU8::new(SchedPolicy::Idle as u8),
+            cpu: AtomicU32::new(ProcessorId::NONE.data()),
             slice: AtomicU64::new(u64::MAX), // IDLE 任务不需要时间片限制
             runtime: AtomicU64::new(0),
             pcb,
@@ -176,33 +180,44 @@ impl SchedEntity {
 
     /// 获取当前 CPU
     #[inline]
-    pub fn cpu(&self) -> Option<u32> {
+    pub fn cpu(&self) -> ProcessorId {
         let cpu = self.cpu.load(Ordering::Acquire);
-        if cpu == CPU_ID_NONE {
-            None
-        } else {
-            Some(cpu)
+        ProcessorId::new(cpu)
+    }
+
+    /// 获取调度策略
+    #[inline]
+    pub fn policy(&self) -> SchedPolicy {
+        match self.policy.load(Ordering::Acquire) {
+            x if x == (SchedPolicy::Idle as u8) => SchedPolicy::Idle,
+            _ => SchedPolicy::RoundRobin,
         }
+    }
+
+    /// 设置调度策略
+    #[inline]
+    pub fn set_policy(&self, policy: SchedPolicy) {
+        self.policy.store(policy as u8, Ordering::Release);
     }
 
     /// 设置当前 CPU
     #[inline]
-    pub fn set_cpu(&self, cpu: u32) {
-        self.cpu.store(cpu, Ordering::Release);
+    pub fn set_cpu(&self, cpu: ProcessorId) {
+        self.cpu.store(cpu.data(), Ordering::Release);
     }
 
     /// 清除 CPU 绑定
     #[inline]
     pub fn clear_cpu(&self) {
-        self.cpu.store(CPU_ID_NONE, Ordering::Release);
+        self.cpu.store(ProcessorId::NONE.data(), Ordering::Release);
     }
 
     /// 原子地尝试设置 CPU（如果当前未绑定）
     /// 返回是否设置成功
     #[inline]
-    pub fn try_set_cpu_if_none(&self, cpu: u32) -> bool {
+    pub fn try_set_cpu_if_none(&self, cpu: ProcessorId) -> bool {
         self.cpu
-            .compare_exchange(CPU_ID_NONE, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(ProcessorId::NONE.data(), cpu.data(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
@@ -298,10 +313,10 @@ impl SchedEntity {
         self.set_state(SchedState::Stopped);
     }
 
-    /// 判断是否是 IDLE 任务（时间片为 u64::MAX）
+    /// 判断是否是 IDLE 任务（根据策略）
     #[inline]
     pub fn is_idle(&self) -> bool {
-        self.slice.load(Ordering::Relaxed) == u64::MAX
+        matches!(self.policy(), SchedPolicy::Idle)
     }
 }
 

@@ -196,7 +196,7 @@ impl Vm {
     #[inline(never)]
     pub fn new_vcpu(&self, id: usize) -> VirtCpu {
         return VirtCpu {
-            cpu: ProcessorId::INVALID,
+            cpu: ProcessorId::NONE,
             kvm: Some(self.lock_vm_ref.clone()),
             vcpu_id: id,
             pid: None,

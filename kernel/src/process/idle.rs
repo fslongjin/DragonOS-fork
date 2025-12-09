@@ -8,7 +8,6 @@ use alloc::{sync::Arc, vec::Vec};
 use crate::{
     mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
     process::KernelStack,
-    sched::{cpu_rq, OnRq},
     smp::cpu::ProcessorId,
 };
 
@@ -62,36 +61,14 @@ impl ProcessManager {
                     .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
             };
 
-            assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
-            *idle_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::IDLE;
+            assert!(idle_pcb.sched_info().on_cpu() == ProcessorId::NONE);
 
-            let rq = cpu_rq(i as usize);
-            let (rq, _guard) = rq.self_lock();
-            rq.set_current(Arc::downgrade(&idle_pcb));
-            rq.set_idle(Arc::downgrade(&idle_pcb));
-
-            *idle_pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-
-            idle_pcb
-                .sched_info()
-                .sched_entity()
-                .force_mut()
-                .set_cfs(Arc::downgrade(&rq.cfs_rq()));
-
-            // 注册到新调度器
-            #[cfg(feature = "sched_new")]
-            {
-                let cpu = ProcessorId::new(i);
-                // 设置 idle 进程的调度实体为 IDLE 类型
-                let entity = idle_pcb.sched_entity().clone();
-                // 标记为 IDLE 任务（时间片设为 u64::MAX）
-                entity.set_slice(u64::MAX);
-                entity.set_cpu(i);
-                entity.set_on_rq(true);
-                // 注册到新调度器的 IDLE 队列
-                sched_new::set_idle_task(cpu, entity);
-            }
+            let cpu = ProcessorId::new(i);
+            // 设置 idle 进程的调度实体为 IDLE 类型
+            let entity = idle_pcb.sched_info().sched_entity().clone();
+            entity.set_cpu(cpu);
+            // 注册到 IDLE 队列
+            sched_new::set_idle_task(cpu, entity);
 
             v.push(idle_pcb);
         }

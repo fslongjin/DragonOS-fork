@@ -217,7 +217,7 @@ pub fn check_ept_features() -> Result<(), SystemError> {
 
 /// 标志当前没有处理器持有内核映射器的锁
 /// 之所以需要这个标志，是因为AtomicUsize::new(0)会把0当作一个处理器的id
-const EPT_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::INVALID;
+const EPT_MAPPER_NO_PROCESSOR: ProcessorId = ProcessorId::NONE;
 /// 当前持有内核映射器锁的处理器
 static EPT_MAPPER_LOCK_OWNER: AtomicProcessorId = AtomicProcessorId::new(EPT_MAPPER_NO_PROCESSOR);
 /// 内核映射器的锁计数器

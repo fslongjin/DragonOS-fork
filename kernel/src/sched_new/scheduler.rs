@@ -10,8 +10,11 @@ use crate::{
     exception::InterruptArch,
     libs::{lazy_init::Lazy, spinlock::SpinLock},
     mm::percpu::{PerCpu, PerCpuVar},
-    process::{ProcessFlags, ProcessManager},
-    smp::{core::smp_get_processor_id, cpu::{try_smp_cpu_manager, ProcessorId}},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{try_smp_cpu_manager, ProcessorId},
+    },
 };
 
 use super::{EnqueueFlags, LocalRunQueue, PerCpuClassRq, SchedEntity, UpdateFlags};
@@ -49,33 +52,27 @@ impl ClassScheduler {
     }
 
     /// 选择最优 CPU
+    ///
+    /// 当前阶段的需求：只有 idle 可以在非 0 号 CPU 上运行，其他任务强制投递到 CPU0。
     pub fn select_cpu(&self, entity: &SchedEntity, _flags: EnqueueFlags) -> ProcessorId {
-        // 如果 SMP 管理器还未初始化，只使用 CPU 0
-        let smp_manager = match try_smp_cpu_manager() {
-            Some(m) => m,
-            None => return ProcessorId::new(0),
-        };
-
-        // 1. 优先使用上次运行的 CPU（缓存亲和性）
-        if let Some(last_cpu) = entity.cpu() {
-            let cpu = ProcessorId::new(last_cpu);
-            // 检查该 CPU 是否 online
-            if smp_manager.is_cpu_online(cpu) {
-                // 简单检查：如果队列不是太长，就用上次的 CPU
-                let rq = cpu_rq(cpu);
-                let guard = rq.lock();
-                if guard.nr_running() < 4 {
-                    return cpu;
-                }
-            }
+        // 非 idle 任务全部绑定 CPU0，避免被投递到其它 CPU
+        if !entity.is_idle() {
+            return ProcessorId::new(0);
         }
 
-        // 2. 简单负载均衡：选择负载最低的 online CPU
-        self.select_least_loaded_cpu_with_manager(smp_manager)
+        // idle 任务：若已绑定 CPU 则复用，否则使用当前 CPU
+        let idle_cpu = entity.cpu();
+        if idle_cpu != ProcessorId::NONE {
+            return idle_cpu;
+        }
+        smp_get_processor_id()
     }
 
     /// 选择负载最低的 online CPU（需要 SMP 管理器）
-    fn select_least_loaded_cpu_with_manager(&self, smp_manager: &'static crate::smp::cpu::SmpCpuManager) -> ProcessorId {
+    fn select_least_loaded_cpu_with_manager(
+        &self,
+        smp_manager: &'static crate::smp::cpu::SmpCpuManager,
+    ) -> ProcessorId {
         let mut min_load = usize::MAX;
         // 默认选择 CPU 0（BSP 始终 online）
         let mut selected = ProcessorId::new(0);
@@ -170,6 +167,13 @@ pub fn sched_init() {
 pub fn sched_enqueue(entity: &Arc<SchedEntity>, flags: EnqueueFlags) -> Option<ProcessorId> {
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
+    // 已退出的任务不应再入队
+    if entity.state().is_exited() {
+        let pid = entity.pcb().map(|p| p.raw_pid().data());
+        log::warn!("sched_enqueue: skip exited entity pid={:?}", pid);
+        return None;
+    }
+
     // 1. 选择目标 CPU
     let target_cpu = scheduler().select_cpu(entity, flags);
 
@@ -182,15 +186,19 @@ pub fn sched_enqueue(entity: &Arc<SchedEntity>, flags: EnqueueFlags) -> Option<P
 
     let pid = entity.pcb().map(|p| p.raw_pid().data()).unwrap_or(9999);
     let nr_before = guard.nr_running();
-    
+
     // 4. 入队
     guard.enqueue(entity.clone(), flags);
 
     let nr_after = guard.nr_running();
-    log::debug!(
-        "sched_enqueue: pid={} target_cpu={} need_preempt={} nr_running: {} -> {}",
-        pid, target_cpu.data(), need_preempt, nr_before, nr_after
-    );
+    // log::debug!(
+    //     "sched_enqueue: pid={} target_cpu={} need_preempt={} nr_running: {} -> {}",
+    //     pid,
+    //     target_cpu.data(),
+    //     need_preempt,
+    //     nr_before,
+    //     nr_after
+    // );
 
     drop(guard);
 
@@ -214,14 +222,27 @@ pub fn sched_enqueue(entity: &Arc<SchedEntity>, flags: EnqueueFlags) -> Option<P
 pub fn wakeup(entity: &Arc<SchedEntity>) -> bool {
     // 检查状态
     let state = entity.state();
+    if state.is_exited() {
+        let pid = entity.pcb().map(|p| p.raw_pid().data());
+        log::warn!("sched_new::wakeup: pid={:?} already exited, skip", pid);
+        return false;
+    }
     if !state.is_wakeable() {
         let pid = entity.pcb().map(|p| p.raw_pid().data()).unwrap_or(9999);
-        log::debug!("sched_new::wakeup: pid={} state={:?} NOT wakeable, skip", pid, state);
+        // log::debug!(
+        //     "sched_new::wakeup: pid={} state={:?} NOT wakeable, skip",
+        //     pid,
+        //     state
+        // );
         return false;
     }
 
     let pid = entity.pcb().map(|p| p.raw_pid().data()).unwrap_or(9999);
-    log::debug!("sched_new::wakeup: pid={} state={:?} -> Runnable", pid, state);
+    // log::debug!(
+    //     "sched_new::wakeup: pid={} state={:?} -> Runnable",
+    //     pid,
+    //     state
+    // );
 
     // 设置为可运行
     entity.mark_runnable();
@@ -252,7 +273,11 @@ pub fn sched_tick() {
 
     if need_resched {
         let pid = ProcessManager::current_pcb().raw_pid().data();
-        log::debug!("sched_tick: pid={} need_resched=true nr_running={}", pid, nr_running);
+        log::debug!(
+            "sched_tick: pid={} need_resched=true nr_running={}",
+            pid,
+            nr_running
+        );
         // 设置需要调度标志
         ProcessManager::current_pcb()
             .flags()
@@ -267,8 +292,17 @@ pub fn schedule(mode: SchedMode) {
     // 检查 preempt_count
     let pcb = ProcessManager::current_pcb();
     if pcb.preempt_count() != 0 {
-        log::warn!("schedule() called with preempt_count != 0");
-        return;
+        let state = pcb.sched_info().sched_entity().state();
+        if state.is_exited() {
+            log::warn!(
+                "schedule(): preempt_count {} while task(pid={}) is exiting, force resched",
+                pcb.preempt_count(),
+                pcb.raw_pid().data()
+            );
+        } else {
+            log::warn!("schedule() called with preempt_count != 0");
+            return;
+        }
     }
 
     do_schedule(mode);
@@ -286,10 +320,6 @@ pub fn do_schedule(mode: SchedMode) {
     let prev_pcb = ProcessManager::current_pcb();
     let prev_entity = guard.current();
 
-    // 调试日志
-    let prev_pid = prev_pcb.raw_pid().data();
-    let prev_sched_state = prev_entity.as_ref().map(|e| e.state());
-
     // 根据模式决定是否更新状态
     let update_flags = match mode {
         SchedMode::None => UpdateFlags::WAIT,
@@ -299,12 +329,114 @@ pub fn do_schedule(mode: SchedMode) {
     // 更新当前任务状态
     guard.update_current(update_flags);
 
+    // 如果当前任务已退出，直接将其从运行队列移除并清空 current，然后立即重新选任务
+    if let Some(ref prev_entity) = prev_entity {
+        if prev_entity.state().is_exited() {
+            let pid = prev_entity.pcb().map(|p| p.raw_pid().data());
+            log::warn!(
+                "do_schedule: current entity already exited pid={:?}, removing",
+                pid
+            );
+            guard.dequeue(prev_entity);
+            guard.clear_current();
+            // 彻底清理退出任务的运行队列状态，避免被错误重选
+            prev_entity.set_on_rq(false);
+            prev_entity.clear_cpu();
+
+            // 直接重新选下一个任务，避免后续逻辑再处理已退出任务
+            let mut next_entity = loop {
+                let picked = guard.pick_next_direct();
+                let Some(ent) = picked else {
+                    log::error!("sched_new: No task to run after removing exited current");
+                    return;
+                };
+                if ent.state().is_exited() || ent.pcb().is_none() {
+                    let pid = ent.pcb().map(|p| p.raw_pid().data());
+                    log::warn!("sched_new: drop picked exited/none pcb entity pid={:?}", pid);
+                    guard.dequeue(&ent);
+                    continue;
+                }
+                break ent;
+            };
+
+            let Some(next_pcb) = next_entity.pcb() else {
+                log::error!("sched_new: Next entity has no PCB after removing exited current");
+                return;
+            };
+
+            // 清除需要调度标志
+            prev_pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
+            fence(Ordering::SeqCst);
+
+            // 设置新的当前任务
+            next_entity.mark_running();
+            next_entity.set_cpu(cpu);
+            guard.set_current(next_entity.clone());
+
+            drop(guard);
+
+            if !Arc::ptr_eq(&prev_pcb, &next_pcb) {
+                unsafe { ProcessManager::switch_process(prev_pcb, next_pcb) };
+            }
+            return;
+        }
+    }
+
     // 选择下一个任务
-    let Some(next_entity) = guard.pick_next() else {
-        // 不应该发生：至少有 IDLE 任务
-        log::error!("sched_new: No task to run!");
-        return;
+    let mut next_entity = loop {
+        let picked = guard.pick_next();
+        let Some(ent) = picked else {
+            // 不应该发生：至少有 IDLE 任务
+            log::error!("sched_new: No task to run!");
+            return;
+        };
+
+        // 若选中退出/无 PCB 的实体，直接丢弃后继续选
+        if ent.state().is_exited() || ent.pcb().is_none() {
+            let pid = ent.pcb().map(|p| p.raw_pid().data());
+            log::warn!("sched_new: drop picked exited/none pcb entity pid={:?}", pid);
+            guard.dequeue(&ent);
+            continue;
+        }
+
+        // 若当前任务已退出且再次被选中，强制改选 idle/其他
+        if let Some(prev_ent) = prev_entity.as_ref() {
+            if Arc::ptr_eq(prev_ent, &ent) && prev_ent.state().is_exited() {
+                guard.dequeue(prev_ent);
+                guard.clear_current();
+                continue;
+            }
+        }
+
+        break ent;
     };
+
+    // 防御：如果仍然拿到了刚刚退出的任务（理论不该发生），强制切到 idle
+    if let Some(prev_ent) = prev_entity.as_ref() {
+        if prev_ent.state().is_exited() && Arc::ptr_eq(prev_ent, &next_entity) {
+            if let Some(idle_ent) = guard.idle_entity() {
+                log::error!(
+                    "sched_new: picked exited entity again (pid={:?}), forcing idle",
+                    prev_ent.pcb().map(|p| p.raw_pid().data())
+                );
+                next_entity = idle_ent;
+            } else {
+                log::error!("sched_new: no idle entity to recover from exited pick, halt");
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    // 若仍然与 prev 相同且 prev 处于退出态，尝试直接切换到 idle
+    if let Some(prev_ent) = prev_entity.as_ref() {
+        if Arc::ptr_eq(prev_ent, &next_entity) && prev_ent.state().is_exited() {
+            if let Some(idle_ent) = guard.idle_entity() {
+                next_entity = idle_ent;
+            }
+        }
+    }
 
     let Some(next_pcb) = next_entity.pcb() else {
         log::error!("sched_new: Next entity has no PCB!");
@@ -350,6 +482,36 @@ pub fn set_idle_task(cpu: ProcessorId, entity: Arc<SchedEntity>) {
     guard.set_idle_task(entity.clone());
     // 同时设置为当前任务（初始时 idle 是当前运行的任务）
     guard.set_current(entity);
+}
+
+/// 强制将当前 CPU 切换到 IDLE，不返回
+///
+/// 用于退出路径的兜底保护，确保当前已退出实体不会再次运行。
+/// 调用者需保证当前任务已标记退出。
+pub fn force_switch_to_idle(prev_pcb: Arc<ProcessControlBlock>) -> ! {
+    let cpu = smp_get_processor_id();
+    let rq = cpu_rq(cpu);
+
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let mut guard = rq.lock();
+
+    let idle_ent = guard.idle_entity().unwrap_or_else(|| {
+        log::error!("force_switch_to_idle: no idle entity on cpu {}", cpu.data());
+        loop {
+            core::hint::spin_loop();
+        }
+    });
+    let idle_pcb = idle_ent
+        .pcb()
+        .unwrap_or_else(|| panic!("force_switch_to_idle: idle entity without pcb"));
+
+    // 将 idle 设置为当前，确保运行队列视图一致
+    guard.set_current(idle_ent.clone());
+    drop(guard);
+
+    // 直接切换上下文；不应返回
+    unsafe { ProcessManager::switch_process(prev_pcb, idle_pcb) };
+    unreachable!("force_switch_to_idle: returned unexpectedly");
 }
 
 /// 当前任务主动让出 CPU
