@@ -41,7 +41,7 @@ use crate::{
 
 use super::{
     file::FileFlags, utils::DName, FilePrivateData, FileSystem, FileType, IndexNode, InodeId,
-    InodeMode, Magic, PollableInode, SuperBlock,
+    InodeMode, PollableInode, SuperBlock,
 };
 
 bitflags! {
@@ -224,8 +224,6 @@ impl MountId {
     }
 }
 
-const MOUNTFS_BLOCK_SIZE: u64 = 512;
-const MOUNTFS_MAX_NAMELEN: u64 = 64;
 /// @brief 挂载文件系统
 /// 挂载文件系统的时候，套了MountFS这一层，以实现文件系统的递归挂载
 pub struct MountFS {
@@ -506,12 +504,12 @@ impl MountFSInode {
             // 当前inode是它所在的文件系统的root inode
             match self.mount_fs.self_mountpoint() {
                 Some(inode) => {
-                    let inner_inode = inode.parent()?;
-                    return Ok(Arc::new_cyclic(|self_ref| MountFSInode {
-                        inner_inode,
-                        mount_fs: self.mount_fs.clone(),
-                        self_ref: self_ref.clone(),
-                    }));
+                    // `inode` 是“父挂载树中”的挂载点 inode。
+                    // Linux 语义：从被挂载文件系统的根目录向上（..）应当回到挂载点的父目录，
+                    // 并且后续路径遍历应当发生在父挂载（inode.mount_fs）上。
+                    //
+                    // 这里直接复用挂载点 inode 的 do_parent()，确保 mount_fs 正确切换。
+                    return inode.do_parent();
                 }
                 None => {
                     return Ok(self.self_ref.upgrade().unwrap());
@@ -579,27 +577,41 @@ impl MountFSInode {
         }
 
         let mut path_parts = Vec::new();
-        let root_inode = ProcessManager::current_mntns().root_inode();
-        let inode_id = root_inode.metadata()?.inode_id;
-        while current.metadata()?.inode_id != inode_id {
+
+        // 注意：不同文件系统的 inode_id 空间可能互相独立，不能用“全局根 inode_id”作为终止条件。
+        // 正确做法应当按挂载树向上走，直到到达“命名空间根”（即 rootfs 的 mount，self_mountpoint 为 None）。
+        loop {
+            // 到达全局根（该 mount 没有挂载点）：结束
+            if current.is_mountpoint_root()? && current.mount_fs.self_mountpoint().is_none() {
+                break;
+            }
+
             let name = current.dname()?;
             path_parts.push(name.0);
 
             // 防循环检查：如果路径深度超过1024，抛出警告
             if path_parts.len() > 1024 {
                 #[inline(never)]
-                fn __log_warn(root: usize, cur: usize) {
+                fn __log_warn(cur: usize) {
                     log::warn!(
-                        "Path depth exceeds 1024, possible infinite loop. root: {}, cur: {}",
-                        root,
+                        "Path depth exceeds 1024, possible infinite loop. cur: {}",
                         cur
                     );
                 }
-                __log_warn(inode_id.data(), current.metadata().unwrap().inode_id.data());
+                __log_warn(current.metadata().unwrap().inode_id.data());
                 return Err(SystemError::ELOOP);
             }
 
-            current = current.do_parent()?;
+            let parent = current.do_parent()?;
+            if Arc::ptr_eq(&parent, &current) {
+                // parent == self 但还没达到全局根，说明挂载树信息不完整或出现环
+                log::warn!(
+                    "absolute_path: parent == self before reaching namespace root, inode_id={}",
+                    current.metadata().unwrap().inode_id.data()
+                );
+                return Err(SystemError::ELOOP);
+            }
+            current = parent;
         }
 
         // 由于我们从叶子节点向上遍历到根节点，所以需要反转路径部分
@@ -614,6 +626,9 @@ impl MountFSInode {
             absolute_path.push_str(&part);
         }
 
+        if absolute_path.is_empty() {
+            absolute_path.push('/');
+        }
         Ok(absolute_path)
     }
 
@@ -797,7 +812,21 @@ impl IndexNode for MountFSInode {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), SystemError> {
-        return self.inner_inode.move_to(old_name, target, new_name, flags);
+        // Filesystem implementations generally expect `target` to be an inode
+        // of the same concrete FS (e.g. tmpfs' LockedTmpfsInode). When VFS
+        // mount wrapping is enabled, `target` is often a `MountFSInode`, which
+        // would make FS-level downcasts fail and incorrectly return EINVAL.
+        //
+        // So we unwrap the mount wrapper before delegating.
+        let target_inner: Arc<dyn IndexNode> = target
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt| mnt.inner_inode.clone())
+            .unwrap_or_else(|| target.clone());
+
+        return self
+            .inner_inode
+            .move_to(old_name, &target_inner, new_name, flags);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -853,10 +882,6 @@ impl IndexNode for MountFSInode {
         let metadata = self.inner_inode.metadata()?;
         if metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
-        }
-
-        if self.is_mountpoint_root()? {
-            return Err(SystemError::EBUSY);
         }
 
         // 若已有挂载系统，保证MountFS只包一层
@@ -1023,6 +1048,9 @@ impl IndexNode for MountFSInode {
 }
 
 impl FileSystem for MountFS {
+    fn support_readahead(&self) -> bool {
+        self.inner_filesystem.support_readahead()
+    }
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         match self.self_mountpoint() {
             Some(inode) => return inode.mount_fs.root_inode(),
@@ -1045,7 +1073,9 @@ impl FileSystem for MountFS {
         self.inner_filesystem.name()
     }
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::MOUNT_MAGIC, MOUNTFS_BLOCK_SIZE, MOUNTFS_MAX_NAMELEN)
+        let mut sb = self.inner_filesystem.super_block();
+        sb.flags = self.mount_flags.bits() as u64;
+        sb
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -1124,9 +1154,18 @@ pub struct MountList {
     inner: RwLock<InnerMountList>,
 }
 
+#[derive(Clone, Debug)]
+struct MountRecord {
+    fs: Arc<MountFS>,
+    ino: Option<InodeId>,
+}
+
 struct InnerMountList {
-    mounts: HashMap<Arc<MountPath>, Arc<MountFS>>,
+    /// 同一路径可能被重复挂载，按栈保存，栈顶为当前可见挂载。
+    mounts: HashMap<Arc<MountPath>, Vec<MountRecord>>,
+    /// 便于通过 fs 反查挂载点 inode。
     mfs2ino: HashMap<Arc<MountFS>, InodeId>,
+    /// inode 到路径的映射，用于子挂载查找。
     ino2mp: HashMap<InodeId, Arc<MountPath>>,
 }
 
@@ -1163,12 +1202,16 @@ impl MountList {
     #[inline(never)]
     pub fn insert(&self, ino: Option<InodeId>, path: Arc<MountPath>, fs: Arc<MountFS>) {
         let mut inner = self.inner.write();
-        inner.mounts.insert(path.clone(), fs.clone());
-        // 如果不是根目录挂载点，则记录inode到挂载点的映射
+        let entry = inner.mounts.entry(path.clone()).or_default();
+        entry.push(MountRecord {
+            fs: fs.clone(),
+            ino,
+        });
         if let Some(ino) = ino {
             inner.ino2mp.insert(ino, path.clone());
-            inner.mfs2ino.insert(fs, ino);
+            inner.mfs2ino.insert(fs.clone(), ino);
         }
+        // 若 ino 为 None（如根挂载），仍然保留 mounts 栈用于后续 pop。
     }
 
     /// # get_mount_point - 获取挂载点的路径
@@ -1194,10 +1237,12 @@ impl MountList {
             .upgradeable_read()
             .mounts
             .iter()
-            .filter_map(|(key, fs)| {
+            .filter_map(|(key, stack)| {
                 let strkey = key.as_str();
                 if let Some(rest) = path.as_ref().strip_prefix(strkey) {
-                    return Some((key.clone(), rest.to_string(), fs.clone()));
+                    return stack
+                        .last()
+                        .map(|rec| (key.clone(), rest.to_string(), rec.fs.clone()));
                 }
                 None
             })
@@ -1221,19 +1266,34 @@ impl MountList {
     pub fn remove<T: Into<MountPath>>(&self, path: T) -> Option<Arc<MountFS>> {
         let mut inner = self.inner.write();
         let path: MountPath = path.into();
-        // 从挂载点列表中移除指定路径的挂载点
-        if let Some(fs) = inner.mounts.remove(&path) {
-            if let Some(ino) = inner.mfs2ino.remove(&fs) {
-                inner.ino2mp.remove(&ino);
+        if let Some(stack) = inner.mounts.get_mut(&path) {
+            if let Some(rec) = stack.pop() {
+                let empty = stack.is_empty();
+                let rec_fs = rec.fs.clone();
+                let rec_ino = rec.ino;
+                if empty {
+                    inner.mounts.remove(&path);
+                }
+                if let Some(ino) = inner.mfs2ino.remove(&rec_fs) {
+                    inner.ino2mp.remove(&ino);
+                }
+                if let Some(ino) = rec_ino {
+                    inner.ino2mp.remove(&ino);
+                }
+                return Some(rec_fs);
             }
-            return Some(fs);
         }
         None
     }
 
     /// # clone_inner - 克隆内部挂载点列表
     pub fn clone_inner(&self) -> HashMap<Arc<MountPath>, Arc<MountFS>> {
-        self.inner.read().mounts.clone()
+        self.inner
+            .read()
+            .mounts
+            .iter()
+            .map(|(p, stack)| (p.clone(), stack.last().unwrap().fs.clone()))
+            .collect()
     }
 
     #[inline(never)]

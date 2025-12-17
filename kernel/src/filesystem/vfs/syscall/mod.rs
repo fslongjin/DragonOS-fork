@@ -1,4 +1,4 @@
-use crate::{syscall::user_access::check_and_clone_cstr, time::PosixTimeSpec};
+use crate::time::PosixTimeSpec;
 
 use super::{fcntl::AtFlags, file::FileFlags, InodeMode, SuperBlock};
 mod dup2;
@@ -9,6 +9,7 @@ mod open_utils;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
+mod sys_chroot;
 mod sys_close;
 mod sys_dup;
 mod sys_dup3;
@@ -36,6 +37,7 @@ mod sys_preadv2;
 mod sys_pselect6;
 mod sys_pwrite64;
 mod sys_pwritev;
+mod sys_pwritev2;
 mod sys_read;
 mod sys_readlinkat;
 mod sys_readv;
@@ -78,6 +80,8 @@ mod sys_epoll_create;
 #[cfg(target_arch = "x86_64")]
 mod sys_epoll_wait;
 
+#[cfg(target_arch = "x86_64")]
+mod sys_creat;
 #[cfg(target_arch = "x86_64")]
 mod sys_futimesat;
 #[cfg(target_arch = "x86_64")]

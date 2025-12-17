@@ -39,6 +39,8 @@ use crate::{
     time::PosixTimeSpec,
 };
 
+use self::proc_maps::open_proc_maps;
+
 use super::vfs::{
     file::{FileFlags, FilePrivateData, NamespaceFilePrivateData},
     utils::DName,
@@ -48,7 +50,9 @@ use super::vfs::{
 pub mod klog;
 pub mod kmsg;
 mod proc_cpuinfo;
+mod proc_maps;
 mod proc_mounts;
+mod proc_pid_cmdline;
 mod proc_thread_self_ns;
 mod proc_version;
 mod procfs_setup;
@@ -78,14 +82,22 @@ pub enum ProcFileType {
     /// /proc/<pid>/fdinfo/<fd> 文件
     ProcFdInfoFile,
     ProcMounts,
+    /// /proc/<pid>/mountinfo
+    ProcMountInfo,
     /// /proc/version
     ProcVersion,
     /// /proc/cpuinfo
     ProcCpuinfo,
+    /// /proc/cmdline
+    ProcCmdline,
+    /// /proc/<pid>/cmdline（也覆盖 /proc/self/cmdline）
+    ProcPidCmdline,
     /// /proc/thread-self/ns itself
     ProcThreadSelfNsRoot,
     /// /proc/thread-self/ns/* namespace files
     ProcThreadSelfNsChild(ThreadSelfNsFileType),
+    /// /proc/<pid>/maps
+    ProcMaps,
     /// /proc/sys/kernel/printk
     ProcSysKernelPrintk,
     //todo: 其他文件类型
@@ -454,6 +466,16 @@ impl ProcFSInode {
         Ok((data.len() * size_of::<u8>()) as i64)
     }
 
+    /// 打开 maps 文件（/proc/<pid>/maps）
+    #[inline(never)]
+    fn open_maps(&self, pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
+        let pid = self
+            .fdata
+            .pid
+            .expect("ProcFS: pid is None when opening 'maps' file.");
+        open_proc_maps(pid, pdata)
+    }
+
     // 打开 exe 文件
     fn open_exe(&self, _pdata: &mut ProcfsFilePrivateData) -> Result<i64, SystemError> {
         // 这个文件是一个软链接，直接返回0即可
@@ -502,9 +524,31 @@ impl ProcFSInode {
         let file = fd_table.get_file_by_fd(fd);
         if let Some(file) = file {
             let inode = file.inode();
-            let path = inode.absolute_path().unwrap();
-            let len = path.len().min(buf.len());
-            buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+            let full = inode
+                .absolute_path()
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            // chroot 视角：若目标在进程 fs root 下，则去掉真实前缀，变为以 "/" 为根的路径。
+            let pcb = ProcessManager::current_pcb();
+            let root_inode = pcb.fs_struct().root();
+            let root_prefix = root_inode
+                .absolute_path()
+                .unwrap_or_else(|_| "/".to_string());
+
+            let shown = if root_prefix != "/" {
+                if full == root_prefix {
+                    "/".to_string()
+                } else if full.starts_with(&(root_prefix.clone() + "/")) {
+                    full[root_prefix.len()..].to_string()
+                } else {
+                    full
+                }
+            } else {
+                full
+            };
+
+            let len = shown.len().min(buf.len());
+            buf[..len].copy_from_slice(&shown.as_bytes()[..len]);
             Ok(len)
         } else {
             return Err(SystemError::EBADF);
@@ -685,6 +729,24 @@ impl ProcFS {
         statm_file.0.lock().fdata.pid = Some(pid);
         statm_file.0.lock().fdata.ftype = ProcFileType::ProcStatm;
 
+        // maps 文件
+        let maps_binding = pid_dir.create("maps", FileType::File, InodeMode::S_IRUGO)?;
+        let maps_file = maps_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        maps_file.0.lock().fdata.pid = Some(pid);
+        maps_file.0.lock().fdata.ftype = ProcFileType::ProcMaps;
+
+        // cmdline 文件: /proc/<pid>/cmdline（供 /proc/self/cmdline 使用）
+        let cmdline_binding = pid_dir.create("cmdline", FileType::File, InodeMode::S_IRUGO)?;
+        let cmdline_file = cmdline_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        cmdline_file.0.lock().fdata.pid = Some(pid);
+        cmdline_file.0.lock().fdata.ftype = ProcFileType::ProcPidCmdline;
+
         // fd dir
         let fd = pid_dir.create("fd", FileType::Dir, InodeMode::from_bits_truncate(0o555))?;
         let fd = fd.as_any_ref().downcast_ref::<LockedProcFSInode>().unwrap();
@@ -701,6 +763,25 @@ impl ProcFS {
             .downcast_ref::<LockedProcFSInode>()
             .unwrap();
         fdinfo.0.lock().fdata.ftype = ProcFileType::ProcFdInfoDir;
+
+        // mounts file: /proc/<pid>/mounts （供 /proc/self/mounts 使用）
+        let mounts_binding = pid_dir.create("mounts", FileType::File, InodeMode::S_IRUGO)?;
+        let mounts_file = mounts_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        mounts_file.0.lock().fdata.pid = Some(pid);
+        mounts_file.0.lock().fdata.ftype = ProcFileType::ProcMounts;
+
+        // mountinfo file: /proc/<pid>/mountinfo
+        let mountinfo_binding = pid_dir.create("mountinfo", FileType::File, InodeMode::S_IRUGO)?;
+        let mountinfo_file = mountinfo_binding
+            .as_any_ref()
+            .downcast_ref::<LockedProcFSInode>()
+            .unwrap();
+        mountinfo_file.0.lock().fdata.pid = Some(pid);
+        mountinfo_file.0.lock().fdata.ftype = ProcFileType::ProcMountInfo;
+
         //todo: 创建其他文件
 
         return Ok(());
@@ -718,6 +799,10 @@ impl ProcFS {
         pid_dir.unlink("exe")?;
         pid_dir.rmdir("fd")?;
         pid_dir.rmdir("fdinfo")?;
+        let _ = pid_dir.unlink("mounts");
+        let _ = pid_dir.unlink("mountinfo");
+        let _ = pid_dir.unlink("maps");
+        let _ = pid_dir.unlink("cmdline");
 
         // 查看进程文件是否还存在
         // let pf= pid_dir.find("status").expect("Cannot find status");
@@ -897,8 +982,17 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcStatus => inode.open_status(&mut proc_private)?,
             ProcFileType::ProcMeminfo => inode.open_meminfo(&mut proc_private)?,
             ProcFileType::ProcStatm => inode.open_statm(&mut proc_private)?,
+            ProcFileType::ProcMaps => inode.open_maps(&mut proc_private)?,
+            ProcFileType::ProcCmdline => inode.open_cmdline(&mut proc_private)?,
+            ProcFileType::ProcPidCmdline => inode.open_pid_cmdline(&mut proc_private)?,
             ProcFileType::ProcExe => inode.open_exe(&mut proc_private)?,
             ProcFileType::ProcMounts => inode.open_mounts(&mut proc_private)?,
+            ProcFileType::ProcMountInfo => {
+                let s = proc_mounts::generate_mountinfo_content();
+                proc_private.data = s.into_bytes();
+                proc_private.data.len() as i64
+            }
+
             ProcFileType::ProcVersion => inode.open_version(&mut proc_private)?,
             ProcFileType::ProcCpuinfo => inode.open_cpuinfo(&mut proc_private)?,
             ProcFileType::ProcSelf => inode.open_self(&mut proc_private)?,
@@ -979,7 +1073,11 @@ impl IndexNode for LockedProcFSInode {
             ProcFileType::ProcStatus
             | ProcFileType::ProcMeminfo
             | ProcFileType::ProcStatm
+            | ProcFileType::ProcMaps
+            | ProcFileType::ProcCmdline
+            | ProcFileType::ProcPidCmdline
             | ProcFileType::ProcMounts
+            | ProcFileType::ProcMountInfo
             | ProcFileType::ProcVersion
             | ProcFileType::ProcCpuinfo => {
                 // 获取数据信息

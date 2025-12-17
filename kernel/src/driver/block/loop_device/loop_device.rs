@@ -30,6 +30,7 @@ use crate::{
     },
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 use alloc::{
     string::{String, ToString},
@@ -170,6 +171,40 @@ impl LoopDevice {
         self.inner.lock()
     }
 
+    fn set_file_locked(
+        inner: &mut LoopDeviceInner,
+        file_inode: Arc<dyn IndexNode>,
+        file_size: usize,
+    ) {
+        inner.file_inode = Some(file_inode);
+        inner.file_size = file_size;
+        inner.offset = 0;
+        inner.size_limit = 0;
+    }
+
+    fn change_file_locked(
+        inner: &mut LoopDeviceInner,
+        file_inode: Arc<dyn IndexNode>,
+        total_size: usize,
+        read_only: bool,
+    ) -> Result<(), SystemError> {
+        if inner.offset > total_size {
+            return Err(SystemError::EINVAL);
+        }
+        let mut effective = total_size - inner.offset;
+        if inner.size_limit > 0 {
+            effective = effective.min(inner.size_limit);
+        }
+        inner.file_inode = Some(file_inode);
+        inner.flags = if read_only {
+            LoopFlags::READ_ONLY
+        } else {
+            LoopFlags::empty()
+        };
+        inner.file_size = effective;
+        Ok(())
+    }
+
     pub fn id(&self) -> usize {
         self.id
     }
@@ -219,35 +254,6 @@ impl LoopDevice {
         Some(dev)
     }
 
-    /// # 功能
-    ///
-    /// 为 loop 设备绑定后端文件并重置相关状态。
-    ///
-    /// ## 参数
-    ///
-    /// - `file_inode`: 需要绑定的文件节点。
-    ///
-    /// ## 返回值
-    /// - `Ok(())`: 成功绑定文件。
-    /// - `Err(SystemError)`: 绑定失败的错误原因。
-    pub fn set_file(&self, file_inode: Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        let metadata = file_inode.metadata()?;
-        if metadata.size < 0 {
-            return Err(SystemError::EINVAL);
-        }
-        let file_size = metadata.size as usize;
-
-        let mut inner = self.inner();
-        inner.file_inode = Some(file_inode);
-        inner.file_size = file_size;
-        inner.offset = 0;
-        inner.size_limit = 0;
-        inner.flags = LoopFlags::empty();
-        drop(inner);
-        self.recalc_effective_size()?;
-        Ok(())
-    }
-
     fn recalc_effective_size(&self) -> Result<(), SystemError> {
         let (file_inode, offset, size_limit) = {
             let inner = self.inner();
@@ -294,23 +300,32 @@ impl LoopDevice {
         file_inode: Arc<dyn IndexNode>,
         read_only: bool,
     ) -> Result<(), SystemError> {
-        {
-            let inner = self.inner();
-            if matches!(inner.state(), LoopState::Bound) {
-                return Err(SystemError::EBUSY);
+        // 先在锁外拿到 metadata，避免在持锁期间做可能阻塞的操作
+        let metadata = file_inode.metadata()?;
+        if metadata.size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+
+        let total_size = metadata.size as usize;
+
+        // 在同一个临界区里完成状态检查 + 状态转换 + 写入 file_inode，
+        // 避免 set_file() 先修改数据、再 set_state() 失败造成“半更新”。
+        let mut inner = self.inner();
+        match inner.state() {
+            LoopState::Unbound => {}
+            LoopState::Bound => return Err(SystemError::EBUSY),
+            LoopState::Rundown | LoopState::Draining | LoopState::Deleting => {
+                return Err(SystemError::ENODEV);
             }
         }
 
-        self.set_file(file_inode.clone())?;
-
-        let mut inner = self.inner();
         inner.set_state(LoopState::Bound)?;
+        Self::set_file_locked(&mut inner, file_inode, total_size);
         inner.flags = if read_only {
             LoopFlags::READ_ONLY
         } else {
             LoopFlags::empty()
         };
-        inner.size_limit = 0;
         drop(inner);
         self.recalc_effective_size()?;
         Ok(())
@@ -494,15 +509,21 @@ impl LoopDevice {
             _ => return Err(SystemError::EINVAL),
         }
 
+        if metadata.size < 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let total_size = metadata.size as usize;
+
+        // 单次持锁完成校验+提交，避免“先读快照再提交”期间状态变化导致不一致
         let mut inner = self.inner();
-        inner.file_inode = Some(inode);
-        inner.flags = if read_only {
-            LoopFlags::READ_ONLY
-        } else {
-            LoopFlags::empty()
-        };
-        drop(inner);
-        self.recalc_effective_size()?;
+        match inner.state() {
+            LoopState::Bound => {}
+            _ => return Err(SystemError::ENODEV),
+        }
+        if inner.file_inode.is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        Self::change_file_locked(&mut inner, inode, total_size, read_only)?;
         Ok(())
     }
 
@@ -527,6 +548,8 @@ impl LoopDevice {
             return Err(SystemError::ENODEV);
         }
         self.active_io_count.fetch_add(1, Ordering::AcqRel);
+        // 通过显式 drop 延长锁守卫的生命周期，避免 NLL 提前释放导致 TOCTOU 竞态
+        drop(inner);
         Ok(())
     }
 
@@ -589,6 +612,10 @@ impl LoopDevice {
         }
         drop(inner);
         let max_checks = LOOP_IO_DRAIN_TIMEOUT_MS * 1000 / LOOP_IO_DRAIN_CHECK_INTERVAL_US;
+        let sleep_ts = PosixTimeSpec::new(
+            0,
+            (LOOP_IO_DRAIN_CHECK_INTERVAL_US as i64).saturating_mul(1000),
+        );
 
         for _i in 0..max_checks {
             let count = self.active_io_count.load(Ordering::Acquire);
@@ -596,7 +623,7 @@ impl LoopDevice {
                 break;
             }
 
-            core::hint::spin_loop();
+            let _ = nanosleep(sleep_ts);
         }
 
         let final_count = self.active_io_count.load(Ordering::Acquire);
@@ -759,18 +786,19 @@ impl IndexNode for LoopDevice {
     }
 
     fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        let file_metadata = match &self.inner().file_inode {
-            Some(inode) => inode.metadata()?,
-            None => {
-                return Err(SystemError::EPERM);
-            }
+        let (inode, file_size, devnum) = {
+            let inner = self.inner();
+            let inode = inner.file_inode.clone().ok_or(SystemError::EPERM)?;
+            (inode, inner.file_size, inner.device_number)
         };
+
+        let file_metadata = inode.metadata()?;
         let metadata = Metadata {
             dev_id: 0,
             inode_id: InodeId::new(0),
-            size: self.inner().file_size as i64,
+            size: file_size as i64,
             blk_size: LBA_SIZE,
-            blocks: (self.inner().file_size.div_ceil(LBA_SIZE)),
+            blocks: file_size.div_ceil(LBA_SIZE),
             atime: file_metadata.atime,
             mtime: file_metadata.mtime,
             ctime: file_metadata.ctime,
@@ -781,7 +809,7 @@ impl IndexNode for LoopDevice {
             nlinks: 1,
             uid: 0,
             gid: 0,
-            raw_dev: self.inner().device_number,
+            raw_dev: devnum,
         };
         Ok(metadata)
     }

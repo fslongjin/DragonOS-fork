@@ -1,3 +1,4 @@
+pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
 pub mod file;
@@ -43,7 +44,10 @@ pub use self::{file::FilePrivateData, mount::MountFS};
 use super::page_cache::PageCache;
 
 /// vfs容许的最大的路径名称长度
-pub const MAX_PATHLEN: usize = 1024;
+pub const MAX_PATHLEN: usize = 4096;
+
+/// 单个文件名的最大长度
+pub const NAME_MAX: usize = 255;
 
 // 定义inode号
 int_like!(InodeId, AtomicInodeId, usize, AtomicUsize);
@@ -296,6 +300,51 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// 是否为“流式”文件（不可 random access / 不可 seek）。
+    ///
+    /// 语义目标：把“pread/pwrite/lseek 应返回 ESPIPE”的判定收敛在 VFS 层，
+    /// 避免在 syscall 层枚举 FileType 或做硬编码特判。
+    ///
+    /// 默认规则仅覆盖“天然流式”的基础类型：Pipe/Socket。
+    /// 其它伪文件（eventfd/epollfd/…）应在各自 inode 中覆写此方法。
+    fn is_stream(&self) -> bool {
+        match self.metadata() {
+            Ok(md) => matches!(md.file_type, FileType::Pipe | FileType::Socket),
+            // 元数据都拿不到时，保守起见按不可 seek 处理，避免误放行 pread/pwrite。
+            Err(_) => true,
+        }
+    }
+
+    /// 是否支持 seek（lseek）。
+    ///
+    /// 默认：普通文件/目录/块设备可 seek；Pipe/Socket/CharDevice 不可 seek；
+    /// 其它类型保守按可 seek（更接近现有行为：lseek 仅显式拒绝 Pipe/CharDevice）。
+    fn supports_seek(&self) -> bool {
+        if self.is_stream() {
+            return false;
+        }
+        match self.metadata() {
+            Ok(md) => !matches!(
+                md.file_type,
+                FileType::Pipe | FileType::Socket | FileType::CharDevice
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// 是否允许 pread（随机读，不推进文件偏移）。
+    ///
+    /// 默认：对 stream 文件返回 false；对非 stream 默认允许。
+    /// 伪文件（如 eventfd/epollfd）应覆写 `is_stream()` 或此方法以匹配 Linux 语义。
+    fn supports_pread(&self) -> bool {
+        !self.is_stream()
+    }
+
+    /// 是否允许 pwrite（随机写，不推进文件偏移）。
+    fn supports_pwrite(&self) -> bool {
+        !self.is_stream()
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -922,7 +971,8 @@ impl dyn IndexNode {
             return Err(SystemError::ENOTDIR);
         }
 
-        let root_inode = ProcessManager::current_mntns().root_inode();
+        // Linux 语义：绝对路径应当以“进程 fs root”（可被 chroot 改变）为起点
+        let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
         let trailing_slash = path.ends_with('/');
 
         // 获取当前进程的凭证（用于路径遍历的权限检查）
@@ -932,7 +982,7 @@ impl dyn IndexNode {
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (root_inode.clone(), String::from(rest))
+            (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
             (self.find(".")?, String::from(path))
@@ -966,6 +1016,16 @@ impl dyn IndexNode {
             // 遇到连续多个"/"的情况
             if name.is_empty() {
                 continue;
+            }
+
+            // 进程 root 边界：当解析到进程 root 时，“..” 不允许逃逸，应当停留在 root。
+            // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
+            if name == ".." {
+                let cur_md = result.metadata()?;
+                let root_md = process_root_inode.metadata()?;
+                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
+                    continue;
+                }
             }
 
             let inode = result.find(&name)?;
@@ -1164,11 +1224,14 @@ bitflags! {
         const DEVFS_MAGIC = 0x1373;
         const FAT_MAGIC =  0xf2f52011;
         const EXT4_MAGIC = 0xef53;
+        const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
+        const DEVPTS_MAGIC = 0x1cd1;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
+        const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
     }
 }
 
@@ -1179,6 +1242,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
 
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
+
+    /// @brief 文件系统是否支持 readahead
+    ///
+    /// 对于内存文件系统（如 tmpfs），数据已经在 page_cache 中，不需要 readahead
+    /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
+    fn support_readahead(&self) -> bool {
+        true // 默认支持 readahead
+    }
 
     /// @brief 本函数用于实现动态转换。
     /// 具体的文件系统在实现本函数时，最简单的方式就是：直接返回self
@@ -1256,19 +1327,20 @@ macro_rules! register_mountable_fs {
         }
 
         #[distributed_slice(FSMAKER)]
-        static $maker_name: FileSystemMaker = FileSystemMaker::new(
-            $fs_name,
-            &($fs::make_fs_bridge
-                as fn(
-                    Option<&dyn FileSystemMakerData>,
-                ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
-            &($fs::make_mount_data_bridge
-                as fn(
-                    Option<&str>,
-                    &str,
-                )
-                    -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
-        );
+        static $maker_name: $crate::filesystem::vfs::FileSystemMaker =
+            $crate::filesystem::vfs::FileSystemMaker::new(
+                $fs_name,
+                &($fs::make_fs_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    )
+                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+            );
     };
 }
 

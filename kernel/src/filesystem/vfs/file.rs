@@ -7,7 +7,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
-use super::{FileType, IndexNode, InodeId, Metadata, SpecialNodeData};
+use super::{
+    append_lock::with_inode_append_lock, FileType, IndexNode, InodeId, Metadata, SpecialNodeData,
+};
+use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
     arch::MMArch,
     driver::{
@@ -38,9 +41,29 @@ use crate::{
         ProcessControlBlock, ProcessManager, RawPid,
     },
 };
-use crate::{filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
+
+#[derive(Clone, Copy, Debug)]
+enum OffsetUpdate {
+    /// Sequential write path: advance file offset by written length.
+    Add,
+    /// Append path: set file offset to end-of-write (actual_offset + written_len).
+    StoreEnd,
+}
+
+/// 写操作的配置参数
+#[derive(Clone, Copy)]
+struct WriteConfig {
+    /// 是否更新文件偏移量
+    update_offset: bool,
+    /// 偏移量更新方式
+    offset_update: OffsetUpdate,
+    /// 文件标志
+    flags: FileFlags,
+    /// inode 标志
+    inode_flags: InodeFlags,
+}
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -371,6 +394,90 @@ pub struct File {
 }
 
 impl File {
+    #[inline(never)]
+    fn limit_write_len_by_fsize(
+        &self,
+        file_type: FileType,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, SystemError> {
+        if !matches!(file_type, FileType::File) {
+            return Ok(len);
+        }
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+
+        if fsize_limit.rlim_cur == u64::MAX {
+            return Ok(len);
+        }
+
+        let limit = fsize_limit.rlim_cur as usize;
+        if offset >= limit {
+            let _ = send_signal_to_pid(
+                current_pcb.raw_pid(),
+                crate::arch::ipc::signal::Signal::SIGXFSZ,
+            );
+            return Err(SystemError::EFBIG);
+        }
+
+        Ok(len.min(limit.saturating_sub(offset)))
+    }
+
+    fn maybe_sync_after_write(
+        &self,
+        flags: FileFlags,
+        inode_flags: InodeFlags,
+    ) -> Result<(), SystemError> {
+        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
+        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
+        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
+        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
+
+        // inode 级别的 S_SYNC 标志
+        let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
+
+        if need_data_sync || inode_sync {
+            if need_metadata_sync || inode_sync {
+                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
+                self.inode.sync()?;
+            } else {
+                // O_DSYNC: 仅数据同步
+                self.inode.datasync()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn write_at_and_finalize(
+        &self,
+        actual_offset: usize,
+        actual_len: usize,
+        buf: &[u8],
+        config: WriteConfig,
+    ) -> Result<usize, SystemError> {
+        let written_len =
+            self.inode
+                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
+
+        if config.update_offset {
+            match config.offset_update {
+                OffsetUpdate::StoreEnd => {
+                    self.offset.store(
+                        actual_offset + written_len,
+                        core::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                OffsetUpdate::Add => {
+                    self.offset
+                        .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+
+        self.maybe_sync_after_write(config.flags, config.inode_flags)?;
+        Ok(written_len)
+    }
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
@@ -408,22 +515,18 @@ impl File {
         let private_data = SpinLock::new(FilePrivateData::default());
         inode.open(private_data.lock(), &flags)?;
 
-        // 设置默认能力 (可以在文件系统的open()中清除)
-        if file_type == FileType::File || file_type == FileType::Dir {
-            mode.insert(
-                FileMode::FMODE_LSEEK
-                    | FileMode::FMODE_PREAD
-                    | FileMode::FMODE_PWRITE
-                    | FileMode::FMODE_ATOMIC_POS,
-            );
-        } else {
-            // 对字符设备等，只要具备读/写权限，就允许 pread/pwrite
-            if mode.contains(FileMode::FMODE_READ) {
-                mode.insert(FileMode::FMODE_PREAD);
-            }
-            if mode.contains(FileMode::FMODE_WRITE) {
-                mode.insert(FileMode::FMODE_PWRITE);
-            }
+        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
+        if inode.is_stream() {
+            mode.insert(FileMode::FMODE_STREAM);
+        }
+        if inode.supports_seek() {
+            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
+        }
+        if inode.supports_pread() {
+            mode.insert(FileMode::FMODE_PREAD);
+        }
+        if inode.supports_pwrite() {
+            mode.insert(FileMode::FMODE_PWRITE);
         }
 
         // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
@@ -495,6 +598,7 @@ impl File {
             len,
             buf,
             true,
+            false,
         )
     }
 
@@ -508,6 +612,34 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // Linux 语义：对不可 seek 的“流式对象”（Pipe/Socket/部分伪文件等），
+        // pread/pwrite/preadv/pwritev 应返回 ESPIPE（优先于读写权限导致的 EBADF）。
+        // 这里用 FMODE_STREAM 作为 VFS 层收敛点，避免因 FMODE_PREAD/权限位组合导致误报 EBADF。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PREAD) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查读权限
+        if !mode.contains(FileMode::FMODE_READ) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 检查读能力
+        if !mode.can_read() {
+            return Err(SystemError::EINVAL);
+        }
+
         self.do_read(offset, len, buf, false)
     }
 
@@ -521,11 +653,66 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.do_write(offset, len, buf, false)
+        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 同 pread：流式对象不支持随机偏移写入，返回 ESPIPE（优先于权限 EBADF）。
+        if mode.contains(FileMode::FMODE_STREAM) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
+        if !mode.contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        // 检查写权限
+        if !mode.contains(FileMode::FMODE_WRITE) {
+            return Err(SystemError::EBADF);
+        }
+
+        self.do_write(offset, len, buf, false, false)
+    }
+
+    /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
+    /// - 对常规文件：忽略当前偏移/给定偏移，追加到 EOF
+    /// - 会推进本 fd 的文件偏移（类似 write）
+    pub fn write_append(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.do_write(
+            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+            len,
+            buf,
+            true,
+            true,
+        )
+    }
+
+    /// 强制追加 pwrite（Linux `RWF_APPEND` 语义）：
+    /// - 对常规文件：忽略给定 offset，追加到 EOF
+    /// - 不推进本 fd 的文件偏移（类似 pwrite）
+    pub fn pwrite_append(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.writeable()?;
+        if !self.mode().contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+        self.do_write(offset, len, buf, false, true)
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
         if self.mode().contains(FileMode::FMODE_RANDOM) {
+            return Ok(());
+        }
+
+        // 检查文件系统是否支持 readahead
+        if !self.inode.fs().support_readahead() {
             return Ok(());
         }
 
@@ -622,6 +809,7 @@ impl File {
         len: usize,
         buf: &[u8],
         update_offset: bool,
+        force_append: bool,
     ) -> Result<usize, SystemError> {
         self.writeable()?;
 
@@ -642,82 +830,52 @@ impl File {
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
 
-        // 按 Linux 语义，带 O_APPEND 的文件写入（包括 pwrite）都会强制在文件末尾进行，
-        // 但偏移有效性检查仍在更上层进行。
-        let actual_offset =
-            if flags.contains(FileFlags::O_APPEND) && matches!(file_type, FileType::File) {
-                md.size as usize
-            } else {
-                offset
-            };
+        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
+            && matches!(file_type, FileType::File);
 
-        let actual_len = if matches!(file_type, FileType::File) {
-            let current_pcb = ProcessManager::current_pcb();
-            let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
+        // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
+        if is_append {
+            let dev_id = md.dev_id;
+            let inode_id = md.inode_id;
+            return with_inode_append_lock(dev_id, inode_id, || {
+                // 在锁内刷新元数据，确保 EOF 是最新的。
+                let md = self.inode.metadata()?;
+                let actual_offset = md.size.max(0) as usize;
+                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-            if fsize_limit.rlim_cur != u64::MAX {
-                let limit = fsize_limit.rlim_cur as usize;
+                self.write_at_and_finalize(
+                    actual_offset,
+                    actual_len,
+                    buf,
+                    WriteConfig {
+                        update_offset,
+                        offset_update: OffsetUpdate::StoreEnd,
+                        flags,
+                        inode_flags,
+                    },
+                )
+            });
+        }
 
-                if actual_offset >= limit {
-                    let _ = send_signal_to_pid(
-                        current_pcb.raw_pid(),
-                        crate::arch::ipc::signal::Signal::SIGXFSZ,
-                    );
-                    return Err(SystemError::EFBIG);
-                }
+        let actual_offset = offset;
+        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
 
-                let max_writable = limit.saturating_sub(actual_offset);
-                if len > max_writable {
-                    max_writable
-                } else {
-                    len
-                }
-            } else {
-                len
-            }
-        } else {
-            len
-        };
-
-        if matches!(file_type, FileType::File) && actual_offset > md.size as usize {
+        if matches!(file_type, FileType::File) && actual_offset > md.size.max(0) as usize {
             self.inode.resize(actual_offset)?;
         }
-        let written_len =
-            self.inode
-                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
-        if update_offset {
-            if flags.contains(FileFlags::O_APPEND) {
-                self.offset.store(
-                    actual_offset + written_len,
-                    core::sync::atomic::Ordering::SeqCst,
-                );
-            } else {
-                self.offset
-                    .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
-        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
-        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
-        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
 
-        // 也检查 inode 级别的 S_SYNC 标志
-        let inode_sync = self
-            .get_inode_flags()
-            .map(|f| f.contains(InodeFlags::S_SYNC))
-            .unwrap_or(false);
-
-        if need_data_sync || inode_sync {
-            if need_metadata_sync || inode_sync {
-                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync()?;
-            } else {
-                // O_DSYNC: 仅数据同步
-                self.inode.datasync()?;
-            }
-        }
-
-        Ok(written_len)
+        self.write_at_and_finalize(
+            actual_offset,
+            actual_len,
+            buf,
+            WriteConfig {
+                update_offset,
+                offset_update: OffsetUpdate::Add,
+                flags,
+                inode_flags,
+            },
+        )
     }
 
     /// @brief 获取文件的元数据
@@ -735,13 +893,16 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
-        let file_type = self.inode.metadata()?.file_type;
-        match file_type {
-            FileType::Pipe | FileType::CharDevice => {
-                return Err(SystemError::ESPIPE);
-            }
-            _ => {}
+        let mode = self.mode();
+        // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
         }
+        if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
+            return Err(SystemError::ESPIPE);
+        }
+
+        let file_type = self.inode.metadata()?.file_type;
         // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
         // and other unsupported seek modes.
         {
@@ -991,8 +1152,30 @@ impl File {
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
     pub fn ftruncate(&self, len: usize) -> Result<(), SystemError> {
-        // 如果文件不可写，返回错误
-        self.writeable()?;
+        // 类型必须是普通文件，否则 EINVAL
+        let md = self.inode.metadata()?;
+        if md.file_type != FileType::File {
+            return Err(SystemError::EINVAL);
+        }
+
+        // O_PATH 直接返回 EBADF，保持与 open 时的行为一致
+        let mode = *self.mode.read();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+
+        // 非可写打开返回 EINVAL（对齐 gVisor 预期）
+        if !mode.contains(FileMode::FMODE_WRITE) || !mode.can_write() {
+            return Err(SystemError::EINVAL);
+        }
+
+        // RLIMIT_FSIZE 检查
+        let current_pcb = ProcessManager::current_pcb();
+        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+        if fsize_limit.rlim_cur != u64::MAX && len as u64 > fsize_limit.rlim_cur {
+            let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+            return Err(SystemError::EFBIG);
+        }
 
         // 统一通过 VFS 封装，复用类型/只读检查
         crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;

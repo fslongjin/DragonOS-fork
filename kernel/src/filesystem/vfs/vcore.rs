@@ -52,6 +52,9 @@ pub fn generate_inode_id() -> InodeId {
 /// 初始化虚拟文件系统
 #[inline(never)]
 pub fn vfs_init() -> Result<(), SystemError> {
+    // Initialize global append lock manager before any file write path uses it.
+    super::append_lock::init_append_lock_manager();
+
     mnt_namespace_init();
 
     procfs_init().expect("Failed to initialize procfs");
@@ -110,6 +113,15 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     unsafe {
         current_mntns.force_change_root_mountfs(new_fs);
     }
+
+    // 换根后需要同步更新“当前进程”的 fs root/pwd。
+    // 我们的路径解析（绝对路径）以进程 fs root 为起点；若不更新，后续诸如 /dev/pts 的挂载、
+    // 以及 init stdio 的 /dev/hvc0 查找都会仍在旧 root 上执行，导致找不到设备节点。
+    let new_root_inode = current_mntns.root_inode();
+    let pcb = ProcessManager::current_pcb();
+    pcb.fs_struct_mut().set_root(new_root_inode.clone());
+    // init 通常 cwd 为 "/"，将 pwd 同步到新根，避免落在旧根造成后续语义混乱
+    pcb.fs_struct_mut().set_pwd(new_root_inode.clone());
 
     // WARNING: mount devpts after devfs has been mounted,
     devpts_init().expect("Failed to initialize devpts");
@@ -228,6 +240,10 @@ pub fn do_mkdir_at(
     let (name, parent) = rsplit_path(path);
     if name == "." || name == ".." {
         return Err(SystemError::EEXIST);
+    }
+    // 检查文件名长度
+    if name.len() > super::NAME_MAX {
+        return Err(SystemError::ENAMETOOLONG);
     }
     if let Some(parent) = parent {
         current_inode =
@@ -371,6 +387,11 @@ pub(super) fn do_file_lookup_at(
 #[inline(never)]
 pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
     let md = inode.metadata()?;
+
+    // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
+    if len > isize::MAX as usize {
+        return Err(SystemError::EINVAL);
+    }
 
     if md.file_type == FileType::Dir {
         return Err(SystemError::EISDIR);
