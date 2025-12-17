@@ -22,6 +22,7 @@ use crate::{
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
+    process::ProcessManager,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -144,7 +145,21 @@ impl IndexNode for LoopControlDevice {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        // loop-control 设备节点由 DevFS 注册；返回其所在的文件系统。
+        if let Some(fs) = self
+            .inner()
+            .device_inode_fs
+            .read()
+            .as_ref()
+            .and_then(|w| w.upgrade())
+        {
+            return fs;
+        }
+        ProcessManager::current_mntns()
+            .root_inode()
+            .find("dev")
+            .expect("LoopControlDevice: DevFS not mounted at /dev")
+            .fs()
     }
 
     fn ioctl(

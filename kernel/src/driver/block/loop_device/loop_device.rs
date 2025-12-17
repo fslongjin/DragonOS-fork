@@ -134,6 +134,9 @@ impl LoopDeviceInner {
             (LoopState::Rundown, LoopState::Draining),
             (LoopState::Rundown, LoopState::Deleting),
             (LoopState::Rundown, LoopState::Unbound),
+            // 允许 Draining 回滚到 Rundown：当 I/O 排空超时/失败时保持拒绝新 I/O，
+            // 并允许后续重试 drain 或继续删除流程。
+            (LoopState::Draining, LoopState::Rundown),
             (LoopState::Draining, LoopState::Deleting),
             (LoopState::Unbound, LoopState::Deleting),
         ];
@@ -254,13 +257,11 @@ impl LoopDevice {
         Some(dev)
     }
 
-    fn recalc_effective_size(&self) -> Result<(), SystemError> {
-        let (file_inode, offset, size_limit) = {
-            let inner = self.inner();
-            (inner.file_inode.clone(), inner.offset, inner.size_limit)
-        };
-
-        let inode = file_inode.ok_or(SystemError::ENODEV)?;
+    fn compute_effective_size(
+        inode: &Arc<dyn IndexNode>,
+        offset: usize,
+        size_limit: usize,
+    ) -> Result<usize, SystemError> {
         let metadata = inode.metadata()?;
         if metadata.size < 0 {
             return Err(SystemError::EINVAL);
@@ -273,10 +274,34 @@ impl LoopDevice {
         if size_limit > 0 {
             effective = effective.min(size_limit);
         }
+        Ok(effective)
+    }
 
-        let mut inner = self.inner();
-        inner.file_size = effective;
-        Ok(())
+    fn recalc_effective_size(&self) -> Result<(), SystemError> {
+        // 通过“快照 -> 计算 -> CAS式提交”的方式避免：
+        // - 持锁期间调用 metadata() 导致阻塞
+        // - offset/limit/inode 并发变化时写入错误的 file_size
+        for _ in 0..3 {
+            let (file_inode, offset, size_limit) = {
+                let inner = self.inner();
+                (inner.file_inode.clone(), inner.offset, inner.size_limit)
+            };
+
+            let inode = file_inode.ok_or(SystemError::ENODEV)?;
+            let effective = Self::compute_effective_size(&inode, offset, size_limit)?;
+
+            let mut inner = self.inner();
+            let still_same_inode = inner
+                .file_inode
+                .as_ref()
+                .map(|cur| Arc::ptr_eq(cur, &inode))
+                .unwrap_or(false);
+            if still_same_inode && inner.offset == offset && inner.size_limit == size_limit {
+                inner.file_size = effective;
+                return Ok(());
+            }
+        }
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
     }
 
     pub fn is_bound(&self) -> bool {
@@ -408,30 +433,35 @@ impl LoopDevice {
             info.lo_sizelimit as usize
         };
 
-        // 保存旧值用于回滚，并在同一个锁作用域内更新
-        let old_values = {
-            let mut inner = self.inner();
+        // 先拿到 inode 快照，在锁外计算新的 effective size，最后在锁内一次性提交：
+        // 避免出现 “offset 已更新但 file_size 仍旧值” 的竞态窗口。
+        let inode_snapshot = {
+            let inner = self.inner();
             if !matches!(inner.state(), LoopState::Bound | LoopState::Rundown) {
                 return Err(SystemError::ENXIO);
             }
-            let old = (inner.offset, inner.size_limit, inner.flags);
-            inner.offset = new_offset;
-            inner.size_limit = new_limit;
-            inner.flags = LoopFlags::from_bits_truncate(info.lo_flags);
-            old
+            inner.file_inode.clone().ok_or(SystemError::ENODEV)?
         };
 
-        if let Err(err) = self.recalc_effective_size() {
-            // 回滚
-            let mut inner = self.inner();
-            inner.offset = old_values.0;
-            inner.size_limit = old_values.1;
-            inner.flags = old_values.2;
-            drop(inner);
-            let _ = self.recalc_effective_size();
-            return Err(err);
-        }
+        let new_effective = Self::compute_effective_size(&inode_snapshot, new_offset, new_limit)?;
 
+        let mut inner = self.inner();
+        if !matches!(inner.state(), LoopState::Bound | LoopState::Rundown) {
+            return Err(SystemError::ENXIO);
+        }
+        let still_same_inode = inner
+            .file_inode
+            .as_ref()
+            .map(|cur| Arc::ptr_eq(cur, &inode_snapshot))
+            .unwrap_or(false);
+        if !still_same_inode {
+            // backing file 并发变化（或被清除），拒绝本次更新，避免写入不一致的 size。
+            return Err(SystemError::EBUSY);
+        }
+        inner.offset = new_offset;
+        inner.size_limit = new_limit;
+        inner.flags = LoopFlags::from_bits_truncate(info.lo_flags);
+        inner.file_size = new_effective;
         Ok(())
     }
 
@@ -633,6 +663,12 @@ impl LoopDevice {
                 self.minor(),
                 final_count
             );
+            // 超时：从 Draining 回滚到 Rundown，保持拒绝新 I/O，并允许后续重试 drain。
+            // 注意：这里不能留在 Draining，否则删除流程会永久卡死（enter_rundown_state 返回 EBUSY）。
+            let mut inner = self.inner();
+            if matches!(inner.state(), LoopState::Draining) {
+                let _ = inner.set_state(LoopState::Rundown);
+            }
             return Err(SystemError::ETIMEDOUT);
         }
 
@@ -748,7 +784,18 @@ impl KObject for LoopDevice {
 
 impl IndexNode for LoopDevice {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        // 设备通常通过 DevFS 的包装 inode 访问；这里返回其所在的文件系统。
+        // 优先使用 devfs 注册时注入的 Weak<DevFS>，避免在正常路径上做路径查找。
+        if let Some(fs) = self.fs.read().upgrade() {
+            return fs;
+        }
+        // 兜底：从当前挂载命名空间中找到 /dev 并取其 fs。
+        // 该路径在系统正常初始化后应始终存在。
+        ProcessManager::current_mntns()
+            .root_inode()
+            .find("dev")
+            .expect("LoopDevice: DevFS not mounted at /dev")
+            .fs()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {

@@ -166,23 +166,57 @@ impl BlockDevManager {
     }
 
     /// 卸载磁盘设备
-    #[allow(dead_code)]
     pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+        // 事务式卸载：
+        // 1) 先尝试从 devfs 卸载所有 gendisk 节点（可能失败）
+        // 2) 全部成功后，再更新 BlockDevManager 与 blk_meta 元数据
+        //
+        // 这样即便中途失败，也不会出现“manager 已移除/元数据已清空，但 devfs 仍残留节点”的不可恢复不一致。
+        {
+            let inner = self.inner();
+            if !inner.disks.contains_key(dev.dev_name()) {
+                return Err(SystemError::ENOENT);
+            }
+        }
+
+        let blk_meta = dev.blkdev_meta();
+        let gendisks: Vec<Arc<GenDisk>> = {
+            let meta_inner = blk_meta.inner();
+            meta_inner.gendisks.values().cloned().collect()
+        };
+
+        let mut unregistered: Vec<Arc<GenDisk>> = Vec::new();
+        for gendisk in &gendisks {
+            let dname = gendisk.dname()?;
+            if let Err(e) = devfs_unregister(dname.as_ref(), gendisk.clone()) {
+                // 回滚：尽量把已卸载的重新注册回 devfs，保持系统可用/一致。
+                for rg in unregistered.into_iter() {
+                    if let Ok(rname) = rg.dname() {
+                        let _ = devfs_register(rname.as_ref(), rg.clone());
+                    }
+                }
+                return Err(e);
+            }
+            unregistered.push(gendisk.clone());
+        }
+
+        // 全部 devfs 卸载成功：再移除 manager 记录并清空 gendisks 元数据
         let mut inner = self.inner();
         if inner.disks.remove(dev.dev_name()).is_none() {
+            // 理论上不应发生：在 devfs 卸载过程中该设备被并发移除
+            // 尽力回滚 devfs，以免留下“manager 不存在但 devfs 存在/不存在”的混乱状态
+            drop(inner);
+            for rg in unregistered.into_iter() {
+                if let Ok(rname) = rg.dname() {
+                    let _ = devfs_register(rname.as_ref(), rg.clone());
+                }
+            }
             return Err(SystemError::ENOENT);
         }
-        let blk_meta = dev.blkdev_meta();
-        let gendisks = {
-            let mut meta_inner = blk_meta.inner();
-            let disks: Vec<Arc<GenDisk>> = meta_inner.gendisks.values().cloned().collect();
-            meta_inner.gendisks.clear();
-            disks
-        };
-        for gendisk in gendisks {
-            let dname = gendisk.dname()?;
-            devfs_unregister(dname.as_ref(), gendisk)?;
-        }
+        drop(inner);
+
+        let mut meta_inner = blk_meta.inner();
+        meta_inner.gendisks.clear();
         Ok(())
     }
     /// 通过路径查找gendisk
