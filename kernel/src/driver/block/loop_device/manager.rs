@@ -24,7 +24,6 @@ pub struct LoopManager {
 pub struct LoopManagerInner {
     devices: [Option<Arc<LoopDevice>>; LoopManager::MAX_DEVICES],
     id_alloc: IdAllocator,
-    next_free_minor: u32,
 }
 
 impl LoopManager {
@@ -39,7 +38,6 @@ impl LoopManager {
                 devices: [const { None }; Self::MAX_DEVICES],
                 id_alloc: IdAllocator::new(0, Self::MAX_DEVICES)
                     .expect("create IdAllocator failed"),
-                next_free_minor: 0,
             }),
         }
     }
@@ -51,6 +49,11 @@ impl LoopManager {
     #[inline]
     fn alloc_id_locked(inner: &mut LoopManagerInner) -> Option<usize> {
         inner.id_alloc.alloc()
+    }
+
+    #[inline]
+    fn alloc_specific_id_locked(inner: &mut LoopManagerInner, id: usize) -> Option<usize> {
+        inner.id_alloc.alloc_specific(id)
     }
 
     #[inline]
@@ -69,30 +72,10 @@ impl LoopManager {
         inner: &LoopManagerInner,
         minor: u32,
     ) -> Option<Arc<LoopDevice>> {
-        inner
-            .devices
-            .iter()
-            .flatten()
-            .find(|device| device.minor() == minor)
-            .map(Arc::clone)
-    }
-
-    fn find_unused_minor_locked(inner: &LoopManagerInner) -> Option<u32> {
-        let mut candidate = inner.next_free_minor;
-        for _ in 0..Self::MAX_DEVICES as u32 {
-            let mut used = false;
-            for dev in inner.devices.iter().flatten() {
-                if dev.minor() == candidate {
-                    used = true;
-                    break;
-                }
-            }
-            if !used {
-                return Some(candidate);
-            }
-            candidate = (candidate + 1) % Self::MAX_DEVICES as u32;
+        if minor >= Self::MAX_DEVICES as u32 {
+            return None;
         }
-        None
+        inner.devices[minor as usize].clone()
     }
 
     /// # 功能
@@ -142,8 +125,9 @@ impl LoopManager {
             return Ok(device);
         }
 
-        let id = Self::alloc_id_locked(inner).ok_or(SystemError::ENOSPC)?;
-        match self.create_and_register_device_locked(inner, id, minor) {
+        let id =
+            Self::alloc_specific_id_locked(inner, minor as usize).ok_or(SystemError::ENOSPC)?;
+        match self.create_and_register_device_locked(inner, id) {
             Ok(device) => Ok(device),
             Err(e) => {
                 Self::free_id_locked(inner, id);
@@ -166,14 +150,7 @@ impl LoopManager {
         }
 
         let id = Self::alloc_id_locked(inner).ok_or(SystemError::ENOSPC)?;
-        let minor = match Self::find_unused_minor_locked(inner) {
-            Some(minor) => minor,
-            None => {
-                Self::free_id_locked(inner, id);
-                return Err(SystemError::ENOSPC);
-            }
-        };
-        let result = self.create_and_register_device_locked(inner, id, minor);
+        let result = self.create_and_register_device_locked(inner, id);
         if result.is_err() {
             Self::free_id_locked(inner, id);
         }
@@ -184,12 +161,12 @@ impl LoopManager {
         &self,
         inner: &mut LoopManagerInner,
         id: usize,
-        minor: u32,
     ) -> Result<Arc<LoopDevice>, SystemError> {
-        if minor >= Self::MAX_DEVICES as u32 {
+        if id >= Self::MAX_DEVICES {
             return Err(SystemError::EINVAL);
         }
-        let devname = Self::format_name(minor as usize);
+        let minor = id as u32;
+        let devname = Self::format_name(id);
         let loop_dev =
             LoopDevice::new_empty_loop_device(devname, id, minor).ok_or(SystemError::ENOMEM)?;
 
@@ -203,7 +180,6 @@ impl LoopManager {
         }
 
         inner.devices[id] = Some(loop_dev.clone());
-        inner.next_free_minor = (minor + 1) % Self::MAX_DEVICES as u32;
         log::info!(
             "Loop device id {} (minor {}) added successfully.",
             id,
@@ -254,9 +230,8 @@ impl LoopManager {
 
         {
             let mut inner = self.inner();
-            inner.devices[id] = None;
-            Self::free_id_locked(&mut inner, id);
-            inner.next_free_minor = minor;
+            inner.devices[minor as usize] = None;
+            Self::free_id_locked(&mut inner, minor as usize);
         }
         info!(
             "Loop device id {} (minor {}) removed successfully.",
@@ -267,16 +242,12 @@ impl LoopManager {
 
     pub fn find_free_minor(&self) -> Option<u32> {
         let inner = self.inner();
-        'outer: for minor in 0..Self::MAX_DEVICES as u32 {
-            for dev in inner.devices.iter().flatten() {
-                if dev.minor() == minor {
-                    if !dev.is_bound() {
-                        return Some(minor);
-                    }
-                    continue 'outer;
-                }
+        for minor in 0..Self::MAX_DEVICES as u32 {
+            match &inner.devices[minor as usize] {
+                Some(dev) if !dev.is_bound() => return Some(minor),
+                Some(_) => continue,
+                None => return Some(minor),
             }
-            return Some(minor);
         }
         None
     }
@@ -288,8 +259,9 @@ impl LoopManager {
             if Self::find_device_by_minor_locked(&inner, minor_u32).is_some() {
                 continue;
             }
-            let id = Self::alloc_id_locked(&mut inner).ok_or(SystemError::ENOSPC)?;
-            if let Err(e) = self.create_and_register_device_locked(&mut inner, id, minor_u32) {
+            let id =
+                Self::alloc_specific_id_locked(&mut inner, minor).ok_or(SystemError::ENOSPC)?;
+            if let Err(e) = self.create_and_register_device_locked(&mut inner, id) {
                 Self::free_id_locked(&mut inner, id);
                 return Err(e);
             }
