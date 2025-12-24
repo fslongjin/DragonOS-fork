@@ -208,6 +208,15 @@ update-submodules-by-mirror:
 	@$(MAKE) update-submodules
 	@git config --global --unset url."https://git.mirrors.dragonos.org.cn/DragonOS-Community/".insteadOf
 
+# 连接到DragonOS串口终端
+connect-serial: check_arch
+	@bash tools/mcp-server/scripts/connect-serial.sh
+
+# 显示串口socket路径
+serial-path: check_arch
+	@echo "串口socket路径: $(ROOT_PATH)/bin/tmp/hypervisor/serial-$(ARCH).sock"
+	@echo "连接命令: socat - UNIX-CONNECT:$(ROOT_PATH)/bin/tmp/hypervisor/serial-$(ARCH).sock"
+
 help:
 	@echo "编译:"
 	@echo "  make all -j <n>       - 本地编译，不运行,n为要用于编译的CPU核心数"
@@ -234,6 +243,8 @@ help:
 	@echo "  make clean-docs       - 清理文档"
 	@echo "  make test-syscall     - 构建运行并执行syscall测试"
 	@echo "                         - 可通过DISK_SAVE_MODE=1启用磁盘节省模式"
+	@echo "  make connect-serial   - 连接到DragonOS串口终端（需要虚拟机运行）"
+	@echo "  make serial-path      - 显示串口socket路径"
 	@echo ""
 	@echo "环境变量:"
 	@echo "  DISK_SAVE_MODE=1     - 启用磁盘节省模式，在写入磁盘镜像前清理构建缓存"

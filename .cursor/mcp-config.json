@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "dragonos": {
+      "command": "python",
+      "args": [
+        "-m",
+        "dragonos_mcp.server"
+      ],
+      "env": {
+        "DRAGONOS_ROOT": "${workspaceFolder}",
+        "PYTHONPATH": "${workspaceFolder}/tools/mcp-server/src"
+      }
+    }
+  }
+}
+
+

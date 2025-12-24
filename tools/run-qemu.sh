@@ -99,9 +99,6 @@ QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="1024M"
-QEMU_MEMORY_BACKEND="dragonos-qemu-shm.ram"
-QEMU_MEMORY_BACKEND_PATH_PREFIX="/dev/shm"
-QEMU_SHM_OBJECT="-object memory-backend-file,size=${QEMU_MEMORY},id=${QEMU_MEMORY_BACKEND},mem-path=${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND},share=on "
 QEMU_SMP="2,cores=2,threads=1,sockets=1"
 QEMU_MONITOR="-monitor stdio"
 QEMU_TRACE="${qemu_trace_std}"
@@ -109,7 +106,7 @@ QEMU_CPU_FEATURES=""
 QEMU_RTC_CLOCK=""
 QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL="-serial file:${QEMU_SERIAL_LOG_FILE}"
-QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none"
+QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw"
 QEMU_ACCELARATE=""
 QEMU_DEVICES=""
 # QEMU_ARGUMENT+=" -S "
@@ -148,7 +145,7 @@ if [ -n "${qemu_accel}" ]; then
 fi
 
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
-    QEMU_MACHINE=" -machine q35,memory-backend=${QEMU_MEMORY_BACKEND} "
+    QEMU_MACHINE=" -machine q35 "
     QEMU_CPU_FEATURES+="-cpu IvyBridge,apic,x2apic,+fpu,check,+vmx,${allflags}"
     QEMU_RTC_CLOCK+=" -rtc clock=host,base=localtime"
     if [ ${VIRTIO_BLK_DEVICE} == false ]; then
@@ -164,7 +161,7 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
 
 elif [ ${ARCH} == "riscv64" ]; then
-    QEMU_MACHINE=" -machine virt,memory-backend=${QEMU_MEMORY_BACKEND} -cpu sifive-u54 "
+    QEMU_MACHINE=" -machine virt -cpu sifive-u54 "
     QEMU_DEVICES_DISK="-device virtio-blk-device,drive=disk "
 elif [ ${ARCH} == "loongarch64" ]; then
     QEMU_MACHINE=" -machine virt"
@@ -241,19 +238,40 @@ setup_kernel_cmdline_from_env
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
-    QEMU_SERIAL=" -serial chardev:mux -monitor chardev:mux -chardev stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+    # 创建socket目录
+    SOCKET_DIR="../bin/tmp/hypervisor"
+    mkdir -p "${SOCKET_DIR}"
+    
+    # 串口socket路径
+    QEMU_SERIAL_SOCK="${SOCKET_DIR}/serial-${ARCH}.sock"
+    QEMU_MONITOR_SOCK="${SOCKET_DIR}/monitor-${ARCH}.sock"
+    
+    # 清理旧的socket文件
+    rm -f "${QEMU_SERIAL_SOCK}" "${QEMU_MONITOR_SOCK}"
+    
+    # 配置串口：使用virtio console通过unix socket，支持多客户端，同时写入日志文件
+    # 在nographic模式下，使用virtconsole替代-serial，避免chardev冲突
+    QEMU_SERIAL=""  # 不使用传统串口，改用virtconsole
+    
+    # 配置monitor：使用独立的unix socket
+    QEMU_MONITOR=" -monitor unix:${QEMU_MONITOR_SOCK},server=on,wait=off "
 
-    # 添加 virtio console 设备
+    # 添加 virtio console 设备，连接到socket
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+      QEMU_DEVICES+=" -device virtio-serial "
+      QEMU_DEVICES+=" -chardev socket,id=virtconsole0,path=${QEMU_SERIAL_SOCK},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+      QEMU_DEVICES+=" -device virtconsole,chardev=virtconsole0 "
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial -device virtconsole,chardev=mux "
+      QEMU_DEVICES+=" -device virtio-serial "
+      QEMU_DEVICES+=" -chardev socket,id=virtconsole0,path=${QEMU_SERIAL_SOCK},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+      QEMU_DEVICES+=" -device virtconsole,chardev=virtconsole0 "
     elif [ ${ARCH} == "riscv64" ]; then
-      QEMU_DEVICES+=" -device virtio-serial-device -device virtconsole,chardev=mux "
+      QEMU_DEVICES+=" -device virtio-serial-device "
+      QEMU_DEVICES+=" -chardev socket,id=virtconsole0,path=${QEMU_SERIAL_SOCK},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE} "
+      QEMU_DEVICES+=" -device virtconsole,chardev=virtconsole0 "
     fi
 
     KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
-    QEMU_MONITOR=""
     QEMU_ARGUMENT+=" --nographic "
 
     KERNEL_CMDLINE=$(echo "${KERNEL_CMDLINE}" | sed 's/^[ \t]*//;s/[ \t]*$//')
@@ -279,7 +297,6 @@ QEMU_DEVICES+=" -netdev user,id=hostnet0,hostfwd=tcp::12580-:12580 -device virti
 QEMU_ARGUMENT+="-d ${QEMU_DISK_IMAGE} -m ${QEMU_MEMORY} -smp ${QEMU_SMP} -boot order=d ${QEMU_MONITOR} -d ${qemu_trace_std} "
 
 QEMU_ARGUMENT+="-s ${QEMU_MACHINE} ${QEMU_CPU_FEATURES} ${QEMU_RTC_CLOCK} ${QEMU_SERIAL} -drive ${QEMU_DRIVE} ${QEMU_DEVICES} "
-QEMU_ARGUMENT+=" ${QEMU_SHM_OBJECT} "
 QEMU_ARGUMENT+=" ${QEMU_ACCELARATE} "
 
 QEMU_ARGUMENT+=" -D ../qemu.log "
@@ -312,9 +329,6 @@ install_riscv_uboot()
 if [ $flag_can_run -eq 1 ]; then
    
 
-# 删除共享内存
-sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
-
 if [ ${BIOS_TYPE} == uefi ] ;then
   if [ ${ARCH} == x86_64 ] ;then
     sh -c "sudo ${QEMU} -bios arch/x86_64/efi/OVMF-pure-efi.fd ${QEMU_ARGUMENT}"
@@ -329,7 +343,7 @@ if [ ${BIOS_TYPE} == uefi ] ;then
 else
   # 如果是i386架构或者x86_64架构，就直接启动
   if [ ${ARCH} == x86_64 ] || [ ${ARCH} == i386 ] ;then
-    sh -c "sudo ${QEMU} ${QEMU_ARGUMENT}"
+    sh -c "${QEMU} ${QEMU_ARGUMENT}"
   elif [ ${ARCH} == riscv64 ] ;then
     # 如果是riscv64架构，就与efi启动一样
     install_riscv_uboot
@@ -340,9 +354,6 @@ else
     echo "不支持的架构: ${ARCH}"
   fi
 fi
-
-# 删除共享内存
-sudo rm -rf ${QEMU_MEMORY_BACKEND_PATH_PREFIX}/${QEMU_MEMORY_BACKEND}
 else
   echo "不满足运行条件"
 fi
