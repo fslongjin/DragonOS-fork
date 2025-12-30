@@ -1194,8 +1194,6 @@ impl LongDirEntry {
         // 把修改后的长目录项刷入磁盘
         fs.gendisk.write_at(cursor.as_slice(), lba)?;
 
-        fs.gendisk.sync()?;
-
         return Ok(());
     }
 }
@@ -1398,8 +1396,6 @@ impl ShortDirEntry {
 
         // 把修改后的长目录项刷入磁盘
         fs.gendisk.write_at(cursor.as_slice(), lba)?;
-
-        fs.gendisk.sync()?;
 
         return Ok(());
     }

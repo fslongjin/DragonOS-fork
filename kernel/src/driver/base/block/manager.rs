@@ -1,4 +1,7 @@
-use core::{fmt::Formatter, sync::atomic::AtomicU32};
+use core::{
+    fmt::Formatter,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+};
 
 use alloc::{sync::Arc, vec::Vec};
 use hashbrown::HashMap;
@@ -25,6 +28,9 @@ use super::{
 };
 
 static mut BLOCK_DEV_MANAGER: Option<BlockDevManager> = None;
+
+/// 全局块设备索引计数器，用于分配唯一的设备缓存 ID
+static BLOCK_DEV_INDEX_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 #[inline]
 pub fn block_dev_manager() -> &'static BlockDevManager {
@@ -316,19 +322,27 @@ pub struct InnerBlockDevMeta {
 
 impl BlockDevMeta {
     pub fn new(devname: DevName, major: Major) -> Self {
+        // 分配唯一的设备索引，用于缓存管理
+        let dev_idx = BLOCK_DEV_INDEX_COUNTER.fetch_add(1, Ordering::SeqCst);
         BlockDevMeta {
             devname,
             major,
             base_minor: block_dev_manager().next_minor(major),
             inner: SpinLock::new(InnerBlockDevMeta {
                 gendisks: GenDiskMap::new(),
-                dev_idx: 0, // 默认索引为0
+                dev_idx,
             }),
         }
     }
 
     pub(crate) fn inner(&self) -> SpinLockGuard<'_, InnerBlockDevMeta> {
         self.inner.lock()
+    }
+
+    /// 获取设备的唯一缓存 ID
+    #[inline]
+    pub fn cache_id(&self) -> usize {
+        self.inner.lock().dev_idx
     }
 }
 

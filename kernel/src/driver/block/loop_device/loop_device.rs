@@ -1,6 +1,7 @@
 use crate::{
     driver::base::{
         block::{
+            block_dev_cache::BlockDeviceCache,
             block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
             disk_info::Partition,
             manager::BlockDevMeta,
@@ -402,6 +403,11 @@ impl LoopDevice {
     /// - `Ok(())`: 成功清除。
     /// - `Err(SystemError)`: 清除过程中的错误。
     pub fn clear_file(&self) -> Result<(), SystemError> {
+        // 先同步并清理缓存
+        let cache_id = self.block_dev_meta.cache_id();
+        let _ = self.cache_sync(); // 同步脏页
+        BlockDeviceCache::remove(cache_id); // 移除缓存
+
         let mut inner = self.inner();
         match inner.state() {
             LoopState::Bound | LoopState::Rundown => inner.set_state(LoopState::Unbound)?,
@@ -1327,7 +1333,8 @@ impl BlockDevice for LoopDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        Ok(())
+        // 同步块设备缓存中的脏页到磁盘
+        self.cache_sync()
     }
 
     fn blk_size_log2(&self) -> u8 {
@@ -1339,6 +1346,10 @@ impl BlockDevice for LoopDevice {
     }
 
     fn device(&self) -> Arc<dyn Device> {
+        self.self_ref.upgrade().unwrap()
+    }
+
+    fn block_device(&self) -> Arc<dyn BlockDevice> {
         self.self_ref.upgrade().unwrap()
     }
 

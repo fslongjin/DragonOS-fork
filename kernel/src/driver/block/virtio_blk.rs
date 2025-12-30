@@ -359,7 +359,8 @@ impl BlockDevice for VirtIOBlkDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        Ok(())
+        // 同步块设备缓存中的脏页到磁盘
+        self.cache_sync()
     }
 
     fn blk_size_log2(&self) -> u8 {
@@ -374,8 +375,12 @@ impl BlockDevice for VirtIOBlkDevice {
         self.self_ref.upgrade().unwrap()
     }
 
+    fn block_device(&self) -> Arc<dyn BlockDevice> {
+        self.self_ref.upgrade().unwrap()
+    }
+
     fn block_size(&self) -> usize {
-        todo!()
+        LBA_SIZE
     }
 
     fn partitions(&self) -> Vec<Arc<Partition>> {

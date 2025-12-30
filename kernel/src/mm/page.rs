@@ -262,9 +262,9 @@ fn page_reclaim_thread() -> i32 {
             // page_manager/page_cache 的锁顺序反转。
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
-            //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            page_reclaimer_lock_irqsave().flush_dirty_pages();
-            // 休眠5秒
+            // 使用安全的脏页刷新方法，避免长时间持锁
+            PageReclaimer::flush_dirty_pages_safe();
+            // 休眠0.5秒
             // log::info!("sleep");
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
         }
@@ -282,6 +282,148 @@ pub struct PageReclaimer {
 }
 
 impl PageReclaimer {
+    /// 合并写回一个页内的脏 buffer heads。
+    ///
+    /// 返回值：是否已把该页内所有可写回的脏 buffer heads 写回并清理 dirty 标记。
+    fn writeback_dirty_buffers_merged(
+        page_index: usize,
+        paddr: PhysAddr,
+        bh: Arc<super::buffer_head::BufferHead>,
+    ) -> bool {
+        use super::buffer_head::BufferHeadIter;
+
+        // run 代表一段连续脏块：同一 bdev、blocknr 连续、页内偏移连续。
+        struct Run {
+            bdev: Arc<dyn crate::driver::base::block::block_device::BlockDevice>,
+            start_block: u64,
+            start_off: usize,
+            len_bytes: usize,
+            block_size: usize,
+            block_count: usize,
+            last_block: u64,
+            last_off: usize,
+        }
+
+        fn flush_run(
+            page_index: usize,
+            paddr: PhysAddr,
+            run: &mut Option<Run>,
+            buffers_to_clear: &mut alloc::vec::Vec<alloc::sync::Arc<super::buffer_head::BufferHead>>,
+            had_error: &mut bool,
+        ) {
+            let Some(r) = run.as_ref() else {
+                buffers_to_clear.clear();
+                return;
+            };
+            if r.len_bytes == 0 {
+                buffers_to_clear.clear();
+                *run = None;
+                return;
+            }
+
+            // 必须是整块长度
+            if r.block_size == 0 || (r.len_bytes % r.block_size) != 0 {
+                log::error!(
+                    "writeback run length not aligned: len={}, bsz={}, page={}",
+                    r.len_bytes,
+                    r.block_size,
+                    page_index
+                );
+                *had_error = true;
+                buffers_to_clear.clear();
+                *run = None;
+                return;
+            }
+
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    (MMArch::phys_2_virt(paddr).unwrap().data() + r.start_off) as *const u8,
+                    r.len_bytes,
+                )
+            };
+
+            if let Err(e) = r
+                .bdev
+                .write_at_sync(r.start_block as usize, r.block_count, data)
+            {
+                log::error!(
+                    "Failed to write back blocks [{}..+{}] for page {}: {:?}",
+                    r.start_block,
+                    r.block_count,
+                    page_index,
+                    e
+                );
+                *had_error = true;
+            } else {
+                for bh in buffers_to_clear.iter() {
+                    bh.clear_dirty();
+                }
+            }
+
+            buffers_to_clear.clear();
+            *run = None;
+        }
+
+        let mut buffers_to_clear: alloc::vec::Vec<alloc::sync::Arc<super::buffer_head::BufferHead>> =
+            alloc::vec::Vec::new();
+        let mut run: Option<Run> = None;
+        let mut had_error = false;
+        let mut saw_dirty = false;
+
+        for buffer in BufferHeadIter::new(bh) {
+            if !(buffer.is_dirty() && buffer.is_mapped()) {
+                flush_run(page_index, paddr, &mut run, &mut buffers_to_clear, &mut had_error);
+                continue;
+            }
+            saw_dirty = true;
+
+            let Some(bdev) = buffer.bdev() else {
+                flush_run(page_index, paddr, &mut run, &mut buffers_to_clear, &mut had_error);
+                continue;
+            };
+
+            let block_nr = buffer.blocknr();
+            let data_offset = buffer.data_offset();
+            let size = buffer.size();
+
+            let can_append = match run.as_ref() {
+                Some(r) => {
+                    Arc::ptr_eq(&r.bdev, &bdev)
+                        && block_nr == r.last_block + 1
+                        && data_offset == r.last_off + size
+                        && size == r.block_size
+                }
+                None => false,
+            };
+
+            if !can_append {
+                flush_run(page_index, paddr, &mut run, &mut buffers_to_clear, &mut had_error);
+                run = Some(Run {
+                    bdev,
+                    start_block: block_nr,
+                    start_off: data_offset,
+                    len_bytes: size,
+                    block_size: size,
+                    block_count: 1,
+                    last_block: block_nr,
+                    last_off: data_offset,
+                });
+                buffers_to_clear.push(buffer.clone());
+            } else {
+                let r = run.as_mut().unwrap();
+                r.len_bytes += size;
+                r.block_count += 1;
+                r.last_block = block_nr;
+                r.last_off = data_offset;
+                buffers_to_clear.push(buffer.clone());
+            }
+        }
+
+        flush_run(page_index, paddr, &mut run, &mut buffers_to_clear, &mut had_error);
+
+        // 没有脏 buffer，视为 clean；否则要求没有错误才算 clean。
+        !saw_dirty || !had_error
+    }
     pub fn new() -> Self {
         Self {
             lru: LruCache::unbounded(),
@@ -392,7 +534,28 @@ impl PageReclaimer {
             }
         };
         let paddr = guard.phys_address();
-        let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
+
+        // 检查是否有自定义的 PageCacheOperations（如块设备）
+        if let Some(cache_ops) = page_cache.cache_ops() {
+            // 使用自定义的回写逻辑
+            Self::writeback_with_cache_ops(guard, &cache_ops, page_index, paddr, unmap);
+            return;
+        }
+
+        // 使用传统的 inode 回写逻辑
+        let inode = match page_cache.inode() {
+            Some(weak_inode) => match weak_inode.upgrade() {
+                Some(inode) => inode,
+                None => {
+                    log::warn!("try to writeback but inode already dropped");
+                    return;
+                }
+            },
+            None => {
+                log::warn!("try to writeback but no inode and no cache_ops");
+                return;
+            }
+        };
 
         for vma in guard.vma_set() {
             let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
@@ -420,8 +583,9 @@ impl PageReclaimer {
         }
 
         let len = if let Ok(metadata) = inode.metadata() {
-            let size = metadata.size as usize;
-            size.saturating_sub(page_index * MMArch::PAGE_SIZE)
+            let size = core::cmp::max(metadata.size, 0) as usize;
+            let remain = size.saturating_sub(page_index * MMArch::PAGE_SIZE);
+            core::cmp::min(MMArch::PAGE_SIZE, remain)
         } else {
             MMArch::PAGE_SIZE
         };
@@ -446,7 +610,86 @@ impl PageReclaimer {
         guard.remove_flags(PageFlags::PG_DIRTY);
     }
 
-    /// lru脏页刷新
+    /// 使用 PageCacheOperations 回写脏页
+    fn writeback_with_cache_ops(
+        guard: &mut RwLockWriteGuard<InnerPage>,
+        _cache_ops: &Arc<dyn crate::mm::page_cache_ops::PageCacheOperations>,
+        page_index: usize,
+        paddr: PhysAddr,
+        _unmap: bool,
+    ) {
+        // 块设备页面通常不会被用户空间映射，所以不需要处理 VMA
+
+        // 合并写回脏 buffer heads；只有全部成功才清 PG_DIRTY。
+        let ok = guard
+            .buffers()
+            .as_ref()
+            .map(|bh| Self::writeback_dirty_buffers_merged(page_index, paddr, bh.clone()))
+            .unwrap_or(true);
+        if ok {
+            guard.remove_flags(PageFlags::PG_DIRTY);
+        }
+    }
+
+    /// lru脏页刷新（对外接口，内部自行获取/释放回收器锁）
+    ///
+    /// 分两阶段执行，避免长时间持有 PAGE_RECLAIMER 锁导致死锁：
+    /// 1) 持有回收器锁，从 LRU 中收集脏页列表；
+    /// 2) 释放回收器锁后，逐个执行写回。
+    pub fn flush_dirty_pages_safe() {
+        Self::flush_dirty_pages_safe_rounds(1)
+    }
+
+    /// 多轮脏页刷新。
+    ///
+    /// 背景：写回某些“上层页”（例如文件页）时，可能会通过块设备缓存再产生新的脏页。
+    /// 单轮 flush 只能保证当前已存在的脏页被处理一次，但无法保证“写回过程中新增的脏页”也被落盘。
+    ///
+    /// 为了让 `sync()` 等接口更符合 Linux 语义，这里允许执行多轮，直到没有脏页或达到上限。
+    pub fn flush_dirty_pages_safe_rounds(max_rounds: usize) {
+        Self::flush_dirty_pages_safe_limited(max_rounds, usize::MAX)
+    }
+
+    /// 多轮脏页刷新（带预算）：每一轮最多写回 `max_pages_per_round` 个脏页。
+    ///
+    /// 用途：避免一次 `sync()` 把海量脏页全部写回导致前台命令长时间“卡死”。
+    pub fn flush_dirty_pages_safe_limited(max_rounds: usize, max_pages_per_round: usize) {
+        let max_rounds = core::cmp::max(1, max_rounds);
+        let max_pages_per_round = core::cmp::max(1, max_pages_per_round);
+
+        for _round in 0..max_rounds {
+            // 阶段1：仅持有回收器锁，收集最多 N 个脏页
+            let dirty_pages: Vec<Arc<Page>> = {
+                let reclaimer = page_reclaimer_lock_irqsave();
+                let mut v: Vec<Arc<Page>> = Vec::new();
+                for (_paddr, page) in reclaimer.lru.iter() {
+                    let guard = page.read_irqsave();
+                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                        v.push(page.clone());
+                        if v.len() >= max_pages_per_round {
+                            break;
+                        }
+                    }
+                }
+                v
+            };
+
+            if dirty_pages.is_empty() {
+                break;
+            }
+
+            // 阶段2：不持有回收器锁，安全地写回脏页
+            for page in dirty_pages {
+                let mut guard = page.write_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    Self::page_writeback(&mut guard, false);
+                }
+            }
+        }
+    }
+
+    /// lru脏页刷新（内部方法，需要持有锁）
+    #[allow(dead_code)]
     pub fn flush_dirty_pages(&mut self) {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
@@ -508,9 +751,10 @@ impl Page {
             inner: RwLock::new(inner),
             phys_addr,
         });
-        if page.read_irqsave().flags == PageFlags::PG_LRU {
-            page_reclaimer_lock_irqsave().insert_page(phys_addr, &page);
-        };
+        // 注意：不在这里调用 page_reclaimer_lock_irqsave().insert_page()
+        // 因为 Page::new 可能在持有 PAGE_MANAGER 锁时被调用，
+        // 在此处获取 PAGE_RECLAIMER 锁会导致锁顺序问题。
+        // LRU 页面的插入由 create_pages 在释放 PAGE_MANAGER 锁后完成。
         page
     }
 
@@ -559,8 +803,8 @@ impl Page {
     }
 }
 
-#[derive(Debug)]
 /// 物理页面信息
+#[derive(Debug)]
 pub struct InnerPage {
     /// 映射到当前page的VMA
     vma_set: HashSet<Arc<LockedVMA>>,
@@ -570,6 +814,9 @@ pub struct InnerPage {
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
+    /// 私有数据 - 用于存储 BufferHead（当 PG_PRIVATE 被设置时）
+    /// 这是 page 和 block 之间的桥梁
+    private: Option<Arc<super::buffer_head::BufferHead>>,
 }
 
 impl InnerPage {
@@ -579,6 +826,7 @@ impl InnerPage {
             flags,
             phys_addr,
             page_type,
+            private: None,
         }
     }
 
@@ -692,6 +940,42 @@ impl InnerPage {
             )
             .fill(0)
         };
+    }
+
+    // ==================== Buffer Head 相关方法 ====================
+
+    /// 获取页面关联的 buffer heads
+    ///
+    /// 如果页面设置了 PG_PRIVATE 标志且有 private 数据，返回 BufferHead 的引用。
+    /// BufferHead 形成环形链表，返回的是链表头。
+    pub fn buffers(&self) -> Option<Arc<super::buffer_head::BufferHead>> {
+        if self.flags.contains(PageFlags::PG_PRIVATE) {
+            self.private.clone()
+        } else {
+            None
+        }
+    }
+
+    /// 将 buffer heads 附加到页面
+    ///
+    /// 设置 PG_PRIVATE 标志并存储 BufferHead。
+    pub fn attach_buffers(&mut self, bh: Arc<super::buffer_head::BufferHead>) {
+        self.private = Some(bh);
+        self.flags.insert(PageFlags::PG_PRIVATE);
+    }
+
+    /// 从页面分离 buffer heads
+    ///
+    /// 清除 PG_PRIVATE 标志并返回之前存储的 BufferHead。
+    pub fn detach_buffers(&mut self) -> Option<Arc<super::buffer_head::BufferHead>> {
+        self.flags.remove(PageFlags::PG_PRIVATE);
+        self.private.take()
+    }
+
+    /// 检查页面是否有 buffer heads
+    #[inline]
+    pub fn has_buffers(&self) -> bool {
+        self.flags.contains(PageFlags::PG_PRIVATE) && self.private.is_some()
     }
 }
 

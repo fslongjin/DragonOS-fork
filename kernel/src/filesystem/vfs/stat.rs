@@ -2,7 +2,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::filesystem::stat::PosixStat,
-    driver::{base::device::device_number::DeviceNumber, block::cache::BLOCK_SIZE},
+    driver::base::{
+        block::block_device::LBA_SIZE,
+        device::device_number::DeviceNumber,
+    },
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
@@ -298,7 +301,7 @@ pub fn vfs_getattr(
         } else {
             metadata.size as u64
         };
-        kstat.blocks = size_bytes.div_ceil(BLOCK_SIZE as u64);
+        kstat.blocks = size_bytes.div_ceil(LBA_SIZE as u64);
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {

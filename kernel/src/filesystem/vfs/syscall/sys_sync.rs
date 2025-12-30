@@ -8,7 +8,7 @@ use crate::{
         syscall::nr::{SYS_SYNC, SYS_SYNCFS},
     },
     filesystem::vfs::file::FileFlags,
-    mm::page::page_reclaimer_lock_irqsave,
+    mm::page::PageReclaimer,
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
@@ -31,7 +31,9 @@ impl Syscall for SysSyncHandle {
         _args: &[usize],
         _frame: &mut TrapFrame,
     ) -> Result<usize, system_error::SystemError> {
-        page_reclaimer_lock_irqsave().flush_dirty_pages();
+        // 预算式 flush：避免一次 sync 长时间阻塞前台。
+        // 剩余脏页由后台页面回收线程继续推进写回。
+        PageReclaimer::flush_dirty_pages_safe_limited(1, 512);
         Ok(0)
     }
 
@@ -80,7 +82,7 @@ impl Syscall for SysSyncFsHandle {
 
         // TODO: now, we ignore the fd and sync all filesystems.
         // In the future, we should sync only the filesystem of the given fd.
-        page_reclaimer_lock_irqsave().flush_dirty_pages();
+        PageReclaimer::flush_dirty_pages_safe_limited(1, 512);
         Ok(0)
     }
 

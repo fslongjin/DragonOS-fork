@@ -13,6 +13,7 @@ use system_error::SystemError;
 use super::vfs::IndexNode;
 use crate::libs::spinlock::SpinLockGuard;
 use crate::mm::page::FileMapInfo;
+use crate::mm::page_cache_ops::PageCacheOperations;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
@@ -32,6 +33,8 @@ pub struct PageCache {
     inner: SpinLock<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
     unevictable: AtomicBool,
+    /// PageCache 操作接口（用于自定义回写逻辑，如块设备）
+    cache_ops: Lazy<Arc<dyn PageCacheOperations>>,
 }
 
 #[derive(Debug)]
@@ -70,12 +73,19 @@ impl InnerPageCache {
         self.pages.remove(&offset)
     }
 
+    /// 获取所有缓存的页面引用（用于遍历）
+    pub fn pages(&self) -> &HashMap<usize, Arc<Page>> {
+        &self.pages
+    }
+
     pub fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
         if buf.is_empty() {
             return Ok(());
         }
 
         let page_num = ((buf.len() - 1) >> MMArch::PAGE_SHIFT) + 1;
+
+        let mut created_pages: Vec<Arc<Page>> = Vec::with_capacity(page_num);
 
         let mut page_manager_guard = page_manager_lock_irqsave();
 
@@ -113,6 +123,18 @@ impl InnerPageCache {
             }
 
             self.add_page(start_page_index + i, &page);
+
+            // 先记录下来：等释放 PAGE_MANAGER 锁后再插入 LRU，避免锁顺序反转。
+            created_pages.push(page.clone());
+        }
+
+        // 释放 PAGE_MANAGER 锁后，把新页加入 PageReclaimer 的 LRU。
+        drop(page_manager_guard);
+        {
+            let mut reclaimer = page_reclaimer_lock_irqsave();
+            for page in &created_pages {
+                reclaimer.insert_page(page.phys_address(), page);
+            }
         }
 
         Ok(())
@@ -134,6 +156,7 @@ impl InnerPageCache {
             return Ok(());
         }
 
+        let mut created_pages: Vec<Arc<Page>> = Vec::with_capacity(page_num);
         let mut page_manager_guard = page_manager_lock_irqsave();
 
         for i in 0..page_num {
@@ -166,6 +189,18 @@ impl InnerPageCache {
             }
 
             self.add_page(page_index, &page);
+
+            // 先记录下来：等释放 PAGE_MANAGER 锁后再插入 LRU，避免锁顺序反转。
+            created_pages.push(page.clone());
+        }
+
+        // 释放 PAGE_MANAGER 锁后，把新页加入 PageReclaimer 的 LRU。
+        drop(page_manager_guard);
+        {
+            let mut reclaimer = page_reclaimer_lock_irqsave();
+            for page in &created_pages {
+                reclaimer.insert_page(page.phys_address(), page);
+            }
         }
 
         Ok(())
@@ -447,8 +482,13 @@ impl InnerPageCache {
 impl Drop for InnerPageCache {
     fn drop(&mut self) {
         // log::debug!("page cache drop");
+        // 释放 page_cache 持有的页时，也必须同步从 LRU 中移除。
+        // 否则 PageReclaimer 仍持有 Arc<Page>，会导致页面无法回收（内存泄漏），
+        // 并且 sync/回写逻辑会遍历到已经“失联”的页面。
+        let mut reclaimer = page_reclaimer_lock_irqsave();
         let mut page_manager = page_manager_lock_irqsave();
         for page in self.pages.values() {
+            let _ = reclaimer.remove_page(&page.phys_address());
             page_manager.remove_page(&page.phys_address());
         }
     }
@@ -468,6 +508,7 @@ impl PageCache {
                 v
             },
             unevictable: AtomicBool::new(false),
+            cache_ops: Lazy::new(),
         })
     }
 
@@ -488,6 +529,27 @@ impl PageCache {
         }
         self.inode.init(inode);
         Ok(())
+    }
+
+    /// 设置 PageCache 操作接口
+    ///
+    /// 用于块设备等需要自定义回写逻辑的场景
+    pub fn set_cache_ops(&self, ops: Arc<dyn PageCacheOperations>) -> Result<(), SystemError> {
+        if self.cache_ops.initialized() {
+            return Err(SystemError::EINVAL);
+        }
+        self.cache_ops.init(ops);
+        Ok(())
+    }
+
+    /// 获取 PageCache 操作接口
+    pub fn cache_ops(&self) -> Option<Arc<dyn PageCacheOperations>> {
+        self.cache_ops.try_get().cloned()
+    }
+
+    /// 检查是否有自定义的 PageCache 操作
+    pub fn has_cache_ops(&self) -> bool {
+        self.cache_ops.initialized()
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<'_, InnerPageCache> {

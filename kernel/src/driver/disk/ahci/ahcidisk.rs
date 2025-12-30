@@ -371,9 +371,10 @@ impl AhciDisk {
         return Ok(count * 512);
     }
 
+    #[allow(dead_code)]
     fn sync(&self) -> Result<(), SystemError> {
-        // 由于目前没有block cache, 因此sync返回成功即可
-        return Ok(());
+        // AhciDisk 是内部结构，实际同步由 LockedAhciDisk 通过 cache_sync() 处理
+        Ok(())
     }
 }
 
@@ -542,11 +543,16 @@ impl BlockDevice for LockedAhciDisk {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        return self.inner().sync();
+        // 同步块设备缓存中的脏页到磁盘
+        self.cache_sync()
     }
 
     #[inline]
     fn device(&self) -> Arc<dyn Device> {
+        return self.inner().self_ref.upgrade().unwrap();
+    }
+
+    fn block_device(&self) -> Arc<dyn BlockDevice> {
         return self.inner().self_ref.upgrade().unwrap();
     }
 

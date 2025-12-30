@@ -1,16 +1,14 @@
 /// 引入Module
-use crate::driver::{
-    base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
-        },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+use crate::driver::base::{
+    block::block_dev_cache::BlockDeviceCache,
+    device::{
+        device_number::{DeviceNumber, Major},
+        DevName, Device, DeviceError, IdTable, BLOCKDEVS,
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    map::{
+        DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+        DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+    },
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -279,6 +277,10 @@ pub trait BlockDevice: Device {
     /// 思路：在BlockDevice的结构体中新增一个self_ref变量，返回self_ref.upgrade()即可。
     fn device(&self) -> Arc<dyn Device>;
 
+    /// @brief 获取块设备的 Arc 引用
+    /// 用于在需要存储块设备引用时使用（如 BufferHead）
+    fn block_device(&self) -> Arc<dyn BlockDevice>;
+
     /// @brief 返回块设备的块大小（单位：字节）
     fn block_size(&self) -> usize;
 
@@ -315,27 +317,13 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e) = cache_response {
-            match e {
-                BlockCacheError::StaticParameterError => {
-                    BlockCache::init();
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-                BlockCacheError::BlockFaultError(fail_vec) => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    let _ = BlockCache::insert(fail_vec, buf);
-                    return Ok(ans);
-                }
-                _ => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-            }
-        } else {
-            return Ok(count * BLOCK_SIZE);
-        }
+        // 获取或创建块设备缓存
+        let cache_id = self.blkdev_meta().cache_id();
+        let bdev = self.block_device();
+        let cache = BlockDeviceCache::get_or_create(cache_id, self.block_size(), &bdev);
+
+        // 通过缓存读取数据
+        cache.read(self, lba_id_start, count, buf)
     }
 
     /// # 函数功能
@@ -346,8 +334,25 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
-        self.write_at_sync(lba_id_start, count, buf)
+        // 获取或创建块设备缓存
+        let cache_id = self.blkdev_meta().cache_id();
+        let bdev = self.block_device();
+        let cache = BlockDeviceCache::get_or_create(cache_id, self.block_size(), &bdev);
+
+        // 通过缓存写入数据
+        cache.write(self, lba_id_start, count, buf)
+    }
+
+    /// # 函数功能
+    /// 同步块设备缓存中的脏页到磁盘
+    fn cache_sync(&self) -> Result<(), SystemError> {
+        // 获取块设备缓存
+        let cache_id = self.blkdev_meta().cache_id();
+        let bdev = self.block_device();
+        let cache = BlockDeviceCache::get_or_create(cache_id, self.block_size(), &bdev);
+
+        // 同步所有脏页到设备
+        cache.sync(self)
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {

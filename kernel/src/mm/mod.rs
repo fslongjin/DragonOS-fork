@@ -21,6 +21,7 @@ use self::{
 };
 
 pub mod allocator;
+pub mod buffer_head;
 pub mod early_ioremap;
 pub mod fault;
 pub mod ident_map;
@@ -32,6 +33,7 @@ pub mod mincore;
 pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
+pub mod page_cache_ops;
 pub mod percpu;
 pub mod readahead;
 pub mod syscall;

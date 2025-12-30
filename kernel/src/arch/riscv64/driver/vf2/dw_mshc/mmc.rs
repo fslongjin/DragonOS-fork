@@ -26,7 +26,7 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::block::cache::BLOCK_SIZE;
+use crate::driver::base::block::block_device::LBA_SIZE;
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::{
     devfs::{DevFS, DeviceINode},
@@ -687,7 +687,7 @@ impl MMC {
     }
 
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-        assert!(buf.len() == BLOCK_SIZE);
+        assert!(buf.len() == LBA_SIZE);
 
         let buf_trans: &mut [usize] = unsafe {
             let len = buf.len() / mem::size_of::<usize>();
@@ -703,9 +703,9 @@ impl MMC {
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) {
-        assert!(buf.len() == BLOCK_SIZE);
+        assert!(buf.len() == LBA_SIZE);
 
-        let mut temp_buf = [0usize; BLOCK_SIZE / core::mem::size_of::<usize>()];
+        let mut temp_buf = [0usize; LBA_SIZE / core::mem::size_of::<usize>()];
 
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -846,7 +846,8 @@ impl BlockDevice for MMC {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        Ok(())
+        // 同步块设备缓存中的脏页到磁盘
+        self.cache_sync()
     }
 
     fn blk_size_log2(&self) -> u8 {
@@ -861,8 +862,12 @@ impl BlockDevice for MMC {
         self.self_ref.upgrade().unwrap()
     }
 
+    fn block_device(&self) -> Arc<dyn BlockDevice> {
+        self.self_ref.upgrade().unwrap()
+    }
+
     fn block_size(&self) -> usize {
-        BLOCK_SIZE
+        LBA_SIZE
     }
 
     fn partitions(&self) -> Vec<Arc<Partition>> {
