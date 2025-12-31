@@ -1,16 +1,13 @@
 /// 引入Module
-use crate::driver::{
-    base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
-        },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+use crate::driver::base::{
+    device::{
+        device_number::{DeviceNumber, Major},
+        DevName, Device, DeviceError, IdTable, BLOCKDEVS,
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    map::{
+        DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+        DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+    },
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -268,6 +265,50 @@ pub trait BlockDevice: Device {
     /// @return: 返回一个固定量，硬编码(编程的时候固定的常量).
     fn blk_size_log2(&self) -> u8;
 
+    /// 异步读取块设备
+    ///
+    /// 默认实现：调用同步接口
+    /// 驱动可以覆盖此方法以提供真正的异步实现
+    ///
+    /// # 参数
+    /// - `lba_id_start`: 起始 LBA
+    /// - `count`: 块数量
+    /// - `buf`: 目标缓冲区
+    ///
+    /// # 返回
+    /// - `Ok(usize)`: 读取的字节数
+    fn read_at_async(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        // 默认实现：调用同步接口
+        self.read_at_sync(lba_id_start, count, buf)
+    }
+
+    /// 异步写入块设备
+    ///
+    /// 默认实现：调用同步接口
+    /// 驱动可以覆盖此方法以提供真正的异步实现
+    ///
+    /// # 参数
+    /// - `lba_id_start`: 起始 LBA
+    /// - `count`: 块数量
+    /// - `buf`: 源缓冲区
+    ///
+    /// # 返回
+    /// - `Ok(usize)`: 写入的字节数
+    fn write_at_async(
+        &self,
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
+        // 默认实现：调用同步接口
+        self.write_at_sync(lba_id_start, count, buf)
+    }
+
     // TODO: 待实现 open, close
 
     /// @brief 本函数用于实现动态转换。
@@ -286,67 +327,28 @@ pub trait BlockDevice: Device {
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
     /// # 函数的功能
-    /// 经由Cache对块设备的读操作
+    /// 读取块设备
+    ///
+    /// 已移除 BlockCache 层，直接调用底层同步读取
     fn read_at(
         &self,
         lba_id_start: BlockId,
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.cache_read(lba_id_start, count, buf)
+        self.read_at_sync(lba_id_start, count, buf)
     }
 
     /// # 函数的功能
-    ///  经由Cache对块设备的写操作
+    /// 写入块设备
+    ///
+    /// 已移除 BlockCache 层，直接调用底层同步写入
     fn write_at(
         &self,
         lba_id_start: BlockId,
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.cache_write(lba_id_start, count, buf)
-    }
-
-    /// # 函数的功能
-    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
-    fn cache_read(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e) = cache_response {
-            match e {
-                BlockCacheError::StaticParameterError => {
-                    BlockCache::init();
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-                BlockCacheError::BlockFaultError(fail_vec) => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    let _ = BlockCache::insert(fail_vec, buf);
-                    return Ok(ans);
-                }
-                _ => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-            }
-        } else {
-            return Ok(count * BLOCK_SIZE);
-        }
-    }
-
-    /// # 函数功能
-    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
-    fn cache_write(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
         self.write_at_sync(lba_id_start, count, buf)
     }
 

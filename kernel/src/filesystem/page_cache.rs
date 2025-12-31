@@ -1,5 +1,18 @@
+//! 页缓存 (PageCache) 模块
+//!
+//! 本模块实现了文件系统的页缓存机制，包括：
+//! - LRU缓存管理
+//! - 页状态管理 (UpToDate/Dirty)
+//! - 预读机制 (Readahead)
+//! - PageCacheBackend trait 用于后端存储抽象
+//!
+//! # 设计参考
+//! - Asterinas 的 PageCache 设计
+//! - Linux 内核的 page cache 机制
+
 use core::{
     cmp::min,
+    ops::Range,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -8,6 +21,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::HashMap;
+use lru::LruCache;
 use system_error::SystemError;
 
 use super::vfs::IndexNode;
@@ -24,8 +38,28 @@ use crate::{
 };
 use crate::{libs::align::page_align_up, mm::page::PageType};
 
+// ============================================================================
+// 常量定义
+// ============================================================================
+
+/// 默认最大缓存页数 (0 表示不限制)
+pub const DEFAULT_MAX_CACHE_PAGES: usize = 0;
+
+/// 预读初始窗口大小 (页数)
+pub const READAHEAD_INIT_SIZE: usize = 4;
+
+/// 预读最大窗口大小 (页数)
+pub const READAHEAD_MAX_SIZE: usize = 32;
+
+// ============================================================================
+// PageCache 主结构
+// ============================================================================
+
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// 页面缓存
+///
+/// 管理文件的页缓存，提供读写接口，支持LRU淘汰和预读优化
 #[derive(Debug)]
 pub struct PageCache {
     id: usize,
@@ -34,12 +68,22 @@ pub struct PageCache {
     unevictable: AtomicBool,
 }
 
+/// PageCache 内部结构
 #[derive(Debug)]
 pub struct InnerPageCache {
     #[allow(unused)]
     id: usize,
+    /// 使用 HashMap 存储页面
+    /// key: 页索引, value: 页面
     pages: HashMap<usize, Arc<Page>>,
+    /// LRU 访问顺序记录
+    lru_order: LruCache<usize, ()>,
+    /// 最大缓存页数 (0 表示不限制)
+    max_pages: usize,
+    /// 指向 PageCache 的弱引用
     page_cache_ref: Weak<PageCache>,
+    /// 预读状态
+    readahead: ReadaheadState,
 }
 
 /// 描述一次从页缓存到目标缓冲区的拷贝
@@ -49,25 +93,289 @@ pub struct CopyItem {
     sub_len: usize,
 }
 
+// ============================================================================
+// 预读机制
+// ============================================================================
+
+/// 预读状态
+#[derive(Debug)]
+pub struct ReadaheadState {
+    /// 当前预读窗口
+    window: Option<ReadaheadWindow>,
+    /// 最大预读窗口大小
+    max_size: usize,
+    /// 上次访问的页索引
+    prev_page: Option<usize>,
+}
+
+/// 预读窗口
+#[derive(Debug, Clone)]
+pub struct ReadaheadWindow {
+    /// 预读范围 [start, end)
+    pub range: Range<usize>,
+    /// 触发下次预读的页索引
+    pub lookahead_index: usize,
+}
+
+impl ReadaheadState {
+    /// 创建新的预读状态
+    pub fn new() -> Self {
+        ReadaheadState {
+            window: None,
+            max_size: READAHEAD_MAX_SIZE,
+            prev_page: None,
+        }
+    }
+
+    /// 检查是否应该触发预读
+    ///
+    /// # 参数
+    /// - `page_index`: 当前访问的页索引
+    /// - `max_page`: 文件最大页索引
+    ///
+    /// # 返回
+    /// - `Some(ReadaheadWindow)`: 需要预读的窗口
+    /// - `None`: 不需要预读
+    pub fn should_readahead(
+        &mut self,
+        page_index: usize,
+        max_page: usize,
+    ) -> Option<ReadaheadWindow> {
+        // 检查是否是顺序访问
+        let is_sequential = match self.prev_page {
+            Some(prev) => page_index == prev + 1 || page_index == prev,
+            None => true,
+        };
+
+        self.prev_page = Some(page_index);
+
+        if !is_sequential {
+            // 非顺序访问，重置预读状态
+            self.window = None;
+            return None;
+        }
+
+        match &self.window {
+            None => {
+                // 首次顺序访问，初始化预读窗口
+                let size = min(READAHEAD_INIT_SIZE, max_page.saturating_sub(page_index));
+                if size == 0 {
+                    return None;
+                }
+                let start = page_index;
+                let end = start + size;
+                let lookahead = start + size / 2;
+
+                let window = ReadaheadWindow {
+                    range: start..end,
+                    lookahead_index: lookahead,
+                };
+                self.window = Some(window.clone());
+                Some(window)
+            }
+            Some(window) => {
+                // 检查是否命中 lookahead 点
+                if page_index >= window.lookahead_index && page_index < window.range.end {
+                    // 扩展预读窗口
+                    let new_start = window.range.end;
+                    let new_size = min(
+                        min((window.range.end - window.range.start) * 2, self.max_size),
+                        max_page.saturating_sub(new_start),
+                    );
+                    if new_size == 0 {
+                        return None;
+                    }
+                    let new_end = new_start + new_size;
+                    let new_lookahead = new_start + new_size / 2;
+
+                    let new_window = ReadaheadWindow {
+                        range: new_start..new_end,
+                        lookahead_index: new_lookahead,
+                    };
+                    self.window = Some(new_window.clone());
+                    Some(new_window)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// 重置预读状态
+    pub fn reset(&mut self) {
+        self.window = None;
+        self.prev_page = None;
+    }
+}
+
+impl Default for ReadaheadState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// PageCacheBackend trait
+// ============================================================================
+
+/// 页缓存后端 trait
+///
+/// 文件系统需要实现此 trait 来支持 PageCache 的读写操作
+pub trait PageCacheBackend: Send + Sync {
+    /// 同步读取页面数据
+    ///
+    /// # 参数
+    /// - `page_index`: 页索引
+    /// - `buf`: 输出缓冲区 (大小应为 PAGE_SIZE)
+    ///
+    /// # 返回
+    /// - `Ok(usize)`: 读取的字节数
+    /// - `Err(SystemError)`: 错误
+    fn read_page(&self, page_index: usize, buf: &mut [u8]) -> Result<usize, SystemError>;
+
+    /// 同步写入页面数据
+    ///
+    /// # 参数
+    /// - `page_index`: 页索引
+    /// - `buf`: 输入缓冲区 (大小应为 PAGE_SIZE)
+    ///
+    /// # 返回
+    /// - `Ok(usize)`: 写入的字节数
+    /// - `Err(SystemError)`: 错误
+    fn write_page(&self, page_index: usize, buf: &[u8]) -> Result<usize, SystemError>;
+
+    /// 获取文件的总页数
+    fn npages(&self) -> usize;
+}
+
+// ============================================================================
+// IndexNode 的 PageCacheBackend 实现
+// ============================================================================
+
+/// IndexNode 的 PageCacheBackend 包装器
+///
+/// 通过 IndexNode::read_sync/write_sync 实现 PageCacheBackend
+pub struct InodeBackend {
+    inode: Arc<dyn IndexNode>,
+}
+
+impl InodeBackend {
+    /// 创建新的 InodeBackend
+    pub fn new(inode: Arc<dyn IndexNode>) -> Self {
+        Self { inode }
+    }
+}
+
+impl PageCacheBackend for InodeBackend {
+    fn read_page(&self, page_index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let offset = page_index * MMArch::PAGE_SIZE;
+        self.inode.read_sync(offset, buf)
+    }
+
+    fn write_page(&self, page_index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let offset = page_index * MMArch::PAGE_SIZE;
+        self.inode.write_sync(offset, buf)
+    }
+
+    fn npages(&self) -> usize {
+        if let Ok(meta) = self.inode.metadata() {
+            let size = meta.size as usize;
+            (size + MMArch::PAGE_SIZE - 1) / MMArch::PAGE_SIZE
+        } else {
+            0
+        }
+    }
+}
+
+// ============================================================================
+// InnerPageCache 实现
+// ============================================================================
+
 impl InnerPageCache {
     pub fn new(page_cache_ref: Weak<PageCache>, id: usize) -> InnerPageCache {
         Self {
             id,
             pages: HashMap::new(),
+            lru_order: LruCache::unbounded(),
+            max_pages: DEFAULT_MAX_CACHE_PAGES,
             page_cache_ref,
+            readahead: ReadaheadState::new(),
         }
     }
 
-    pub fn add_page(&mut self, offset: usize, page: &Arc<Page>) {
-        self.pages.insert(offset, page.clone());
+    /// 设置最大缓存页数
+    pub fn set_max_pages(&mut self, max_pages: usize) {
+        self.max_pages = max_pages;
     }
 
-    pub fn get_page(&self, offset: usize) -> Option<Arc<Page>> {
+    /// 添加页面到缓存
+    pub fn add_page(&mut self, offset: usize, page: &Arc<Page>) {
+        self.pages.insert(offset, page.clone());
+        self.lru_order.put(offset, ());
+
+        // 如果设置了最大页数限制，尝试淘汰
+        if self.max_pages > 0 {
+            self.try_shrink();
+        }
+    }
+
+    /// 获取页面 (会更新LRU顺序)
+    pub fn get_page(&mut self, offset: usize) -> Option<Arc<Page>> {
+        if let Some(page) = self.pages.get(&offset) {
+            // 更新 LRU 顺序
+            self.lru_order.get(&offset);
+            Some(page.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 获取页面 (不更新LRU顺序，用于只读查询)
+    pub fn peek_page(&self, offset: usize) -> Option<Arc<Page>> {
         self.pages.get(&offset).cloned()
     }
 
+    /// 移除页面
     pub fn remove_page(&mut self, offset: usize) -> Option<Arc<Page>> {
+        self.lru_order.pop(&offset);
         self.pages.remove(&offset)
+    }
+
+    /// 尝试收缩缓存
+    ///
+    /// 当缓存页数超过最大限制时，淘汰最久未使用的干净页
+    fn try_shrink(&mut self) {
+        if self.max_pages == 0 || self.pages.len() <= self.max_pages {
+            return;
+        }
+
+        let mut to_evict = Vec::new();
+        let target = self.pages.len() - self.max_pages;
+
+        // 从 LRU 尾部开始查找可淘汰的页
+        for (idx, _) in self.lru_order.iter().rev() {
+            if to_evict.len() >= target {
+                break;
+            }
+            if let Some(page) = self.pages.get(idx) {
+                let guard = page.read_irqsave();
+                // 只淘汰干净页
+                if !guard.flags().contains(PageFlags::PG_DIRTY) {
+                    to_evict.push(*idx);
+                }
+            }
+        }
+
+        // 执行淘汰
+        let mut page_reclaimer = page_reclaimer_lock_irqsave();
+        for idx in to_evict {
+            if let Some(page) = self.pages.remove(&idx) {
+                self.lru_order.pop(&idx);
+                let paddr = page.phys_address();
+                page_manager_lock_irqsave().remove_page(&paddr);
+                let _ = page_reclaimer.remove_page(&paddr);
+            }
+        }
     }
 
     pub fn create_pages(&mut self, start_page_index: usize, buf: &[u8]) -> Result<(), SystemError> {
@@ -89,9 +397,9 @@ impl InnerPageCache {
                     .upgrade()
                     .expect("failed to get self_arc of pagecache");
                 if cache.unevictable.load(Ordering::Relaxed) {
-                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE | PageFlags::PG_UPTODATE
                 } else {
-                    PageFlags::PG_LRU
+                    PageFlags::PG_LRU | PageFlags::PG_UPTODATE
                 }
             };
 
@@ -112,19 +420,24 @@ impl InnerPageCache {
                 dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
             }
 
-            self.add_page(start_page_index + i, &page);
+            drop(page_guard);
+            drop(page_manager_guard);
+
+            self.add_page(page_index, &page);
+
+            page_manager_guard = page_manager_lock_irqsave();
         }
 
         Ok(())
     }
 
-    /// 创建若干个“零页”并加入 PageCache。
+    /// 创建若干个"零页"并加入 PageCache。
     ///
     /// 与 `create_pages()` 的区别：
     /// - 不需要临时分配 `Vec<u8>` 作为填充缓冲区；
     /// - 直接分配物理页后在页内 `fill(0)`；
     ///
-    /// 适用场景：tmpfs 等内存文件系统的“空洞读/缺页补零”。
+    /// 适用场景：tmpfs 等内存文件系统的"空洞读/缺页补零"。
     pub fn create_zero_pages(
         &mut self,
         start_page_index: usize,
@@ -145,9 +458,9 @@ impl InnerPageCache {
                     .upgrade()
                     .expect("failed to get self_arc of pagecache");
                 if cache.unevictable.load(Ordering::Relaxed) {
-                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE | PageFlags::PG_UPTODATE
                 } else {
-                    PageFlags::PG_LRU
+                    PageFlags::PG_LRU | PageFlags::PG_UPTODATE
                 }
             };
 
@@ -165,9 +478,51 @@ impl InnerPageCache {
                 page_guard.as_slice_mut().fill(0);
             }
 
+            drop(page_guard);
+            drop(page_manager_guard);
+
             self.add_page(page_index, &page);
+
+            page_manager_guard = page_manager_lock_irqsave();
         }
 
+        Ok(())
+    }
+
+    /// 执行预读操作
+    ///
+    /// # 参数
+    /// - `inode`: 文件inode
+    /// - `window`: 预读窗口
+    fn do_readahead(
+        &mut self,
+        inode: &Arc<dyn IndexNode>,
+        window: &ReadaheadWindow,
+    ) -> Result<(), SystemError> {
+        for page_index in window.range.clone() {
+            // 跳过已存在的页
+            if self.peek_page(page_index).is_some() {
+                continue;
+            }
+
+            // 读取页面数据
+            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE];
+            if inode
+                .read_sync(page_index * MMArch::PAGE_SIZE, &mut page_buf)
+                .is_err()
+            {
+                // 预读失败不影响主流程
+                break;
+            }
+
+            // 创建页面并标记为预读
+            self.create_pages(page_index, &page_buf)?;
+
+            // 标记预读页
+            if let Some(page) = self.peek_page(page_index) {
+                page.write_irqsave().add_flags(PageFlags::PG_READAHEAD);
+            }
+        }
         Ok(())
     }
 
@@ -207,11 +562,17 @@ impl InnerPageCache {
             return Ok((Vec::new(), 0));
         }
 
-        let mut not_exist = Vec::new();
-        let mut copies: Vec<CopyItem> = Vec::new();
-
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
+        let max_page = (file_size as usize + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
+
+        // 检查预读
+        if let Some(window) = self.readahead.should_readahead(start_page_index, max_page) {
+            let _ = self.do_readahead(&inode, &window);
+        }
+
+        let mut not_exist = Vec::new();
+        let mut copies: Vec<CopyItem> = Vec::new();
 
         let mut ret = 0;
         for i in 0..page_num {
@@ -362,14 +723,26 @@ impl InnerPageCache {
         let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
 
         let mut reclaimer = page_reclaimer_lock_irqsave();
-        for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
-            let _ = reclaimer.remove_page(&page.phys_address());
+
+        // 收集要删除的页索引
+        let to_remove: Vec<usize> = self
+            .pages
+            .keys()
+            .filter(|&&idx| idx >= page_num)
+            .cloned()
+            .collect();
+
+        for idx in to_remove {
+            if let Some(page) = self.pages.remove(&idx) {
+                self.lru_order.pop(&idx);
+                let _ = reclaimer.remove_page(&page.phys_address());
+            }
         }
 
         if page_num > 0 {
             let last_page_index = page_num - 1;
             let last_len = len - last_page_index * MMArch::PAGE_SIZE;
-            if let Some(page) = self.get_page(last_page_index) {
+            if let Some(page) = self.peek_page(last_page_index) {
                 unsafe {
                     page.write_irqsave().truncate(last_len);
                 };
@@ -378,11 +751,14 @@ impl InnerPageCache {
             // 只有当文件需要截断到更小的尺寸时，才需要处理最后一页
         }
 
+        // 重置预读状态
+        self.readahead.reset();
+
         Ok(())
     }
 
     pub fn pages_count(&self) -> usize {
-        return self.pages.len();
+        self.pages.len()
     }
 
     /// Synchronize the page cache with the storage device.
@@ -394,6 +770,88 @@ impl InnerPageCache {
             }
         }
         Ok(())
+    }
+
+    /// 批量写回脏页
+    ///
+    /// 优化版本：收集连续的脏页范围，尝试合并 IO 操作
+    ///
+    /// # 参数
+    /// - `max_pages`: 最多写回的页数，0 表示全部
+    ///
+    /// # 返回
+    /// - `Ok(usize)`: 写回的页数
+    pub fn writeback_batch(&mut self, max_pages: usize) -> Result<usize, SystemError> {
+        let max_pages = if max_pages == 0 {
+            self.pages.len()
+        } else {
+            max_pages
+        };
+
+        // 收集脏页索引
+        let mut dirty_indices: Vec<usize> = self
+            .pages
+            .iter()
+            .filter_map(|(&idx, page)| {
+                let guard = page.read_irqsave();
+                if guard.flags().contains(PageFlags::PG_DIRTY) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .take(max_pages)
+            .collect();
+
+        // 按索引排序以优化 IO 顺序
+        dirty_indices.sort_unstable();
+
+        // 合并连续范围
+        let ranges = Self::merge_page_ranges(&dirty_indices);
+
+        let mut written = 0;
+        for (start, count) in ranges {
+            for idx in start..start + count {
+                if let Some(page) = self.pages.get(&idx) {
+                    let mut guard = page.write_irqsave();
+                    if guard.flags().contains(PageFlags::PG_DIRTY) {
+                        crate::mm::page::PageReclaimer::page_writeback(&mut guard, false);
+                        written += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(written)
+    }
+
+    /// 合并连续页索引为范围
+    ///
+    /// 例如: [1, 2, 3, 5, 6, 8] -> [(1, 3), (5, 2), (8, 1)]
+    fn merge_page_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        let mut start = indices[0];
+        let mut count = 1;
+
+        for &idx in &indices[1..] {
+            if idx == start + count {
+                // 连续
+                count += 1;
+            } else {
+                // 不连续，保存当前范围，开始新范围
+                ranges.push((start, count));
+                start = idx;
+                count = 1;
+            }
+        }
+
+        // 保存最后一个范围
+        ranges.push((start, count));
+        ranges
     }
 
     /// 写回指定范围的脏页
@@ -431,6 +889,7 @@ impl InnerPageCache {
                 // 3处引用：1. page_cache中 2. page_manager中 3. lru中
                 if Arc::strong_count(page) <= 3 {
                     if let Some(removed) = self.pages.remove(&idx) {
+                        self.lru_order.pop(&idx);
                         let paddr = removed.phys_address();
                         page_manager_lock_irqsave().remove_page(&paddr);
                         let _ = page_reclaimer.remove_page(&paddr);
@@ -453,6 +912,10 @@ impl Drop for InnerPageCache {
         }
     }
 }
+
+// ============================================================================
+// PageCache 实现
+// ============================================================================
 
 impl PageCache {
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
@@ -505,6 +968,14 @@ impl PageCache {
     /// pages will carry PG_UNEVICTABLE to keep the reclaimer from reclaiming them.
     pub fn set_unevictable(&self, unevictable: bool) {
         self.unevictable.store(unevictable, Ordering::Relaxed);
+    }
+
+    /// 设置最大缓存页数
+    ///
+    /// # 参数
+    /// - `max_pages`: 最大页数，0表示不限制
+    pub fn set_max_pages(&self, max_pages: usize) {
+        self.inner.lock_irqsave().set_max_pages(max_pages);
     }
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁

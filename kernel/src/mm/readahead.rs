@@ -102,13 +102,13 @@ impl<'a> ReadaheadControl<'a> {
 
         if set_flag {
             set_flag = page_cache_guard
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
                 .is_none();
         }
 
         let missing_pages: Vec<_> = (0..number_to_read)
             .map(|i| start_index + i)
-            .filter(|&idx| page_cache_guard.get_page(idx).is_none())
+            .filter(|&idx| page_cache_guard.peek_page(idx).is_none())
             .collect();
 
         drop(page_cache_guard);
@@ -142,7 +142,7 @@ impl<'a> ReadaheadControl<'a> {
         if set_flag {
             let page_cache_guard = page_cache.lock_irqsave();
             if let Some(page) = page_cache_guard
-                .get_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
+                .peek_page(self.ra_state.start + self.ra_state.size - self.ra_state.async_size)
             {
                 // log::debug!(
                 //     "set ra flag at {}",
@@ -184,7 +184,7 @@ impl<'a> ReadaheadControl<'a> {
             let page_cache_gaurd = self.page_cache.lock_irqsave();
             let next_missing_page = {
                 (start_index..start_index + max_pages)
-                    .find(|idx| page_cache_gaurd.get_page(*idx).is_none())
+                    .find(|idx| page_cache_gaurd.peek_page(*idx).is_none())
             };
 
             if let Some(next_missing_page) = next_missing_page {

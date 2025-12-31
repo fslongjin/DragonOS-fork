@@ -97,7 +97,7 @@ impl LockedVMA {
                 Some(page_cache) => {
                     let cache_guard = page_cache.lock_irqsave();
                     for i in 0..nr {
-                        if cache_guard.get_page(pgoff + i).is_some() {
+                        if cache_guard.peek_page(pgoff + i).is_some() {
                             vec[vec_offset + i] = 1;
                         } else {
                             vec[vec_offset + i] = 0;

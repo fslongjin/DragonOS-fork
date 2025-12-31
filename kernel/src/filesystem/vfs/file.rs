@@ -794,7 +794,7 @@ impl File {
             let mut missing_page = None;
 
             for index in start_page..=end_page {
-                match page_cache_guard.get_page(index) {
+                match page_cache_guard.peek_page(index) {
                     Some(page)
                         if page
                             .read_irqsave()

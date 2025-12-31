@@ -14,6 +14,7 @@ use core::{
 };
 
 use crate::arch::MMArch;
+use crate::driver::base::block::block_device::LBA_SIZE as BLOCK_SIZE;
 use crate::driver::base::block::block_device::{BlockDevice, BlockId, GeneralBlockRange};
 use crate::driver::base::block::disk_info::Partition;
 use crate::driver::base::block::manager::BlockDevMeta;
@@ -26,7 +27,6 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::block::cache::BLOCK_SIZE;
 use crate::filesystem::devfs::LockedDevFSInode;
 use crate::filesystem::{
     devfs::{DevFS, DeviceINode},

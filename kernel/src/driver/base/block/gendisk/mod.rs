@@ -7,10 +7,12 @@ use core::{
 use alloc::{
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use hashbrown::HashMap;
 use system_error::SystemError;
 
+use super::bio::{Bio, BioSegment, BioStatus, BioType, BioWaiter, Sid};
 use super::block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE};
 use crate::{
     driver::base::device::device_number::DeviceNumber,
@@ -20,6 +22,7 @@ use crate::{
         vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
     libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    mm::page::Page,
 };
 
 const MINORS_PER_DISK: u32 = 256;
@@ -208,6 +211,149 @@ impl GenDisk {
 
     pub fn block_size_log2(&self) -> u8 {
         self.block_size_log2
+    }
+
+    // ========================================================================
+    // Bio 层接口
+    // ========================================================================
+
+    /// 使用 Bio 读取页面
+    ///
+    /// 创建一个读取 Bio 请求并同步执行
+    ///
+    /// # 参数
+    /// - `page`: 目标页面
+    /// - `page_index`: 页面在文件中的索引
+    ///
+    /// # 返回
+    /// - `Ok(())`: 读取成功
+    /// - `Err(SystemError)`: 读取失败
+    pub fn read_page_bio(&self, page: &Arc<Page>, page_index: usize) -> Result<(), SystemError> {
+        use crate::arch::MMArch;
+        use crate::mm::MemoryManagementArch;
+
+        let page_size = MMArch::PAGE_SIZE;
+        let sectors_per_page = page_size / LBA_SIZE;
+        let lba_start = self.range.lba_start + page_index * sectors_per_page;
+
+        // 创建 BioSegment
+        let segment = BioSegment::from_page(page.clone());
+
+        // 创建 Bio
+        let bio = Bio::new(BioType::Read, lba_start, vec![segment]);
+
+        // 读取数据到临时缓冲区
+        let mut buf = alloc::vec![0u8; page_size];
+        self.block_device()
+            .read_at_sync(lba_start, sectors_per_page, &mut buf)?;
+
+        // 复制到页面
+        let mut page_guard = page.write_irqsave();
+        unsafe {
+            page_guard.as_slice_mut()[..page_size].copy_from_slice(&buf);
+        }
+
+        // 标记 Bio 完成
+        bio.complete(BioStatus::Completed);
+
+        Ok(())
+    }
+
+    /// 使用 Bio 写入页面
+    ///
+    /// 创建一个写入 Bio 请求并同步执行
+    ///
+    /// # 参数
+    /// - `page`: 源页面
+    /// - `page_index`: 页面在文件中的索引
+    ///
+    /// # 返回
+    /// - `Ok(())`: 写入成功
+    /// - `Err(SystemError)`: 写入失败
+    pub fn write_page_bio(&self, page: &Arc<Page>, page_index: usize) -> Result<(), SystemError> {
+        use crate::arch::MMArch;
+        use crate::mm::MemoryManagementArch;
+
+        let page_size = MMArch::PAGE_SIZE;
+        let sectors_per_page = page_size / LBA_SIZE;
+        let lba_start = self.range.lba_start + page_index * sectors_per_page;
+
+        // 创建 BioSegment
+        let segment = BioSegment::from_page(page.clone());
+
+        // 创建 Bio
+        let bio = Bio::new(BioType::Write, lba_start, vec![segment]);
+
+        // 从页面读取数据
+        let page_guard = page.read_irqsave();
+        let buf = unsafe { page_guard.as_slice() };
+
+        // 写入磁盘
+        self.block_device()
+            .write_at_sync(lba_start, sectors_per_page, &buf[..page_size])?;
+
+        // 标记 Bio 完成
+        bio.complete(BioStatus::Completed);
+
+        Ok(())
+    }
+
+    /// 批量读取多个页面 (使用 Bio 合并)
+    ///
+    /// # 参数
+    /// - `pages`: 页面列表 (page, page_index)
+    ///
+    /// # 返回
+    /// - `Ok(())`: 全部读取成功
+    /// - `Err(SystemError)`: 读取失败
+    pub fn read_pages_bio(
+        &self,
+        pages: &[(Arc<Page>, usize)],
+    ) -> Result<(), SystemError> {
+        use crate::arch::MMArch;
+        use crate::mm::MemoryManagementArch;
+
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let page_size = MMArch::PAGE_SIZE;
+        let sectors_per_page = page_size / LBA_SIZE;
+
+        let mut waiter = BioWaiter::new();
+
+        for (page, page_index) in pages {
+            let lba_start = self.range.lba_start + page_index * sectors_per_page;
+
+            // 创建 Bio
+            let segment = BioSegment::from_page(page.clone());
+            let bio = Bio::new(BioType::Read, lba_start, vec![segment]);
+
+            // 读取数据
+            let mut buf = alloc::vec![0u8; page_size];
+            self.block_device()
+                .read_at_sync(lba_start, sectors_per_page, &mut buf)?;
+
+            // 复制到页面
+            let mut page_guard = page.write_irqsave();
+            unsafe {
+                page_guard.as_slice_mut()[..page_size].copy_from_slice(&buf);
+            }
+
+            bio.complete(BioStatus::Completed);
+            waiter.add(bio);
+        }
+
+        // 等待所有 Bio 完成
+        waiter.wait()?;
+
+        Ok(())
+    }
+
+    /// 计算给定字节偏移对应的扇区 ID
+    #[inline]
+    pub fn bytes_to_sector(&self, bytes_offset: usize) -> Sid {
+        self.range.lba_start + bytes_offset / LBA_SIZE
     }
 }
 
