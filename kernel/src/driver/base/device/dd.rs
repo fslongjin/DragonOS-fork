@@ -94,6 +94,7 @@ impl DeviceManager {
                 .ok_or(SystemError::EINVAL)?;
             let mut data = DeviceAttachData::new(dev.clone(), allow_async, false);
             let mut flag = false;
+            TODO: 把drivers这里的锁改为RwMutex!!!!
             for driver in bus.subsystem().drivers().iter() {
                 let r = self.do_device_attach_driver(driver, &mut data);
                 if unlikely(r.is_err()) {
