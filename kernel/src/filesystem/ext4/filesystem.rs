@@ -28,6 +28,8 @@ pub struct Ext4FileSystem {
     pub(super) fs: another_ext4::Ext4,
     /// 当前文件系统对应的设备号
     pub(super) raw_dev: DeviceNumber,
+    /// 当前文件系统所在的磁盘
+    pub gendisk: Arc<GenDisk>,
 
     /// 根 inode
     root_inode: Arc<LockedExt4Inode>,
@@ -54,6 +56,10 @@ impl FileSystem for Ext4FileSystem {
         vfs::SuperBlock::new(Magic::EXT4_MAGIC, another_ext4::BLOCK_SIZE as u64, 255)
     }
 
+    fn get_block_device(&self) -> Result<alloc::sync::Arc<dyn crate::driver::base::block::block_device::BlockDevice>, SystemError> {
+        Ok(self.gendisk.block_device())
+    }
+
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         PageFaultHandler::filemap_fault(pfm)
     }
@@ -78,7 +84,7 @@ impl Ext4FileSystem {
 
     pub fn from_gendisk(mount_data: Arc<GenDisk>) -> Result<Arc<dyn FileSystem>, SystemError> {
         let raw_dev = mount_data.device_num();
-        let fs = another_ext4::Ext4::load(mount_data)?;
+        let fs = another_ext4::Ext4::load(mount_data.clone())?;
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| {
                 LockedExt4Inode(SpinLock::new(Ext4Inode {
@@ -96,6 +102,7 @@ impl Ext4FileSystem {
         let fs = Arc::new(Ext4FileSystem {
             fs,
             raw_dev,
+            gendisk: mount_data,
             root_inode,
         });
 

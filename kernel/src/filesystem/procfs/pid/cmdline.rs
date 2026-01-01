@@ -10,7 +10,10 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{
+        mutex::MutexGuard,
+        spinlock::SpinLockGuard,
+    },
     process::{ProcessManager, RawPid},
 };
 use alloc::sync::{Arc, Weak};
@@ -37,7 +40,7 @@ impl FileOps for CmdlineFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 查找进程
         let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;

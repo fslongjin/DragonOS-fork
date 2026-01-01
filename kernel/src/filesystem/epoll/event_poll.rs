@@ -4,6 +4,7 @@ use crate::{
         FilePrivateData,
     },
     libs::{
+        mutex::Mutex,
         rbtree::RBTree,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
@@ -120,7 +121,7 @@ impl EventPoll {
         )?;
 
         // 设置ep_file的FilePrivateData
-        ep_file.private_data = SpinLock::new(FilePrivateData::EPoll(EPollPrivateData { epoll }));
+        ep_file.private_data = Mutex::new(FilePrivateData::EPoll(EPollPrivateData { epoll }));
         Ok(ep_file)
     }
 

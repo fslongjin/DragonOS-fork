@@ -11,7 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
     process::RawPid,
 };
 use alloc::sync::{Arc, Weak};
@@ -39,7 +39,7 @@ impl FileOps for PidMountsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = generate_mounts_content();
         proc_read(offset, len, buf, content.as_bytes())

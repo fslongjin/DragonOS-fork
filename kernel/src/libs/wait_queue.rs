@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::{
-    mutex::MutexGuard,
+    mutex::{Mutex, MutexGuard},
     spinlock::{SpinLock, SpinLockGuard},
 };
 
@@ -467,7 +467,7 @@ fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError
 /// 事件等待队列：按事件掩码唤醒
 #[derive(Debug)]
 pub struct EventWaitQueue {
-    wait_list: SpinLock<Vec<(u64, Arc<Waker>)>>,
+    wait_list: Mutex<Vec<(u64, Arc<Waker>)>>,
 }
 
 impl Default for EventWaitQueue {
@@ -480,7 +480,7 @@ impl Default for EventWaitQueue {
 impl EventWaitQueue {
     pub fn new() -> Self {
         Self {
-            wait_list: SpinLock::new(Default::default()),
+            wait_list: Mutex::new(Default::default()),
         }
     }
 
@@ -488,7 +488,7 @@ impl EventWaitQueue {
         before_sleep_check(0);
         let (waiter, waker) = Waiter::new_pair();
         {
-            let mut guard = self.wait_list.lock_irqsave();
+            let mut guard = self.wait_list.lock();
             guard.push((events, waker));
         }
         let _ = waiter.wait(true);
@@ -498,7 +498,7 @@ impl EventWaitQueue {
         before_sleep_check(1);
         let (waiter, waker) = Waiter::new_pair();
         {
-            let mut guard = self.wait_list.lock_irqsave();
+            let mut guard = self.wait_list.lock();
             guard.push((events, waker));
         }
         drop(to_unlock);
@@ -507,7 +507,7 @@ impl EventWaitQueue {
 
     pub fn wakeup_any(&self, events: u64) -> usize {
         let mut ret = 0;
-        let mut guard = self.wait_list.lock_irqsave();
+        let mut guard = self.wait_list.lock();
         guard.retain(|(es, waker)| {
             if *es & events > 0 {
                 if waker.wake() {
@@ -523,7 +523,7 @@ impl EventWaitQueue {
 
     pub fn wakeup(&self, events: u64) -> usize {
         let mut ret = 0;
-        let mut guard = self.wait_list.lock_irqsave();
+        let mut guard = self.wait_list.lock();
         guard.retain(|(es, waker)| {
             if *es == events {
                 if waker.wake() {

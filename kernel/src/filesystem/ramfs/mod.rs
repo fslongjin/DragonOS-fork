@@ -10,7 +10,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{mutex::MutexGuard, spinlock::{SpinLock, SpinLockGuard}},
     time::PosixTimeSpec,
 };
 
@@ -197,13 +197,13 @@ impl IndexNode for LockedRamFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
@@ -214,7 +214,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -246,7 +246,7 @@ impl IndexNode for LockedRamFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);

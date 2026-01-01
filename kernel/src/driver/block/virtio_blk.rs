@@ -4,15 +4,20 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
+    collections::VecDeque,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use bitmap::{static_bitmap, traits::BitMapOps};
+use core::sync::atomic::{AtomicBool, Ordering};
+use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
-use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE};
 
 use crate::{
     driver::{
@@ -49,9 +54,13 @@ use crate::{
     },
     init::initcall::INITCALL_POSTCORE,
     libs::{
-        rwlock::RwLock,
-        rwsem::{RwSemReadGuard, RwSemWriteGuard},
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        wait_queue::WaitQueue,
+    },
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        ProcessFlags,
     },
 };
 
@@ -107,7 +116,7 @@ fn virtioblk_manager_init() -> Result<(), SystemError> {
 }
 
 pub struct VirtIOBlkManager {
-    inner: SpinLock<InnerVirtIOBlkManager>,
+    inner: Mutex<InnerVirtIOBlkManager>,
 }
 
 struct InnerVirtIOBlkManager {
@@ -120,14 +129,14 @@ impl VirtIOBlkManager {
 
     pub fn new() -> Self {
         Self {
-            inner: SpinLock::new(InnerVirtIOBlkManager {
+            inner: Mutex::new(InnerVirtIOBlkManager {
                 id_bmp: bitmap::StaticBitmap::new(),
                 devname: [const { None }; Self::MAX_DEVICES],
             }),
         }
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkManager> {
+    fn inner(&self) -> MutexGuard<'_, InnerVirtIOBlkManager> {
         self.inner.lock()
     }
 
@@ -162,11 +171,17 @@ impl VirtIOBlkManager {
 pub struct VirtIOBlkDevice {
     blkdev_meta: BlockDevMeta,
     dev_id: Arc<DeviceId>,
-    inner: SpinLock<InnerVirtIOBlkDevice>,
+    inner: Mutex<InnerVirtIOBlkDevice>,
+    /// virtio-drivers 的 non-blocking API 本身不阻塞；设备对象由 worker 与 IRQ 共享。
+    blk: Mutex<VirtIOBlk<HalImpl, VirtIOTransport>>,
+    submit_wq: WaitQueue,
+    has_work: AtomicBool,
+    pending: Mutex<VecDeque<Arc<crate::driver::block::bio::Bio>>>,
+    inflight: Mutex<HashMap<u16, Inflight>>,
     locked_kobj_state: LockedKObjectState,
     self_ref: Weak<Self>,
-    parent: RwLock<Weak<LockedDevFSInode>>,
-    fs: RwLock<Weak<DevFS>>,
+    parent: RwSem<Weak<LockedDevFSInode>>,
+    fs: RwSem<Weak<DevFS>>,
     metadata: Metadata,
 }
 
@@ -181,6 +196,54 @@ impl Debug for VirtIOBlkDevice {
 
 unsafe impl Send for VirtIOBlkDevice {}
 unsafe impl Sync for VirtIOBlkDevice {}
+
+struct DmaBounce {
+    paddr: virtio_drivers::PhysAddr,
+    vaddr: core::ptr::NonNull<u8>,
+    pages: usize,
+    len: usize,
+}
+
+impl DmaBounce {
+    fn new(len: usize) -> Result<Self, SystemError> {
+        let pages = len.div_ceil(PAGE_SIZE).max(1);
+        let (paddr, vaddr) = <HalImpl as Hal>::dma_alloc(pages, BufferDirection::Both);
+        if paddr == 0 {
+            return Err(SystemError::ENOMEM);
+        }
+        Ok(Self {
+            paddr,
+            vaddr,
+            pages,
+            len,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.vaddr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.vaddr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for DmaBounce {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = <HalImpl as Hal>::dma_dealloc(self.paddr, self.vaddr, self.pages);
+        }
+    }
+}
+
+struct Inflight {
+    bio: Arc<crate::driver::block::bio::Bio>,
+    op: crate::driver::block::bio::BioOp,
+    bytes: usize,
+    req: Box<BlkReq>,
+    resp: Box<BlkResp>,
+    dma: DmaBounce,
+}
 
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
@@ -198,33 +261,255 @@ impl VirtIOBlkDevice {
             return None;
         }
 
-        let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
-        device_inner.enable_interrupts();
+        let mut blk: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
+        blk.enable_interrupts();
+
         let dev = Arc::new_cyclic(|self_ref| Self {
             blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
             self_ref: self_ref.clone(),
             dev_id,
             locked_kobj_state: LockedKObjectState::default(),
-            inner: SpinLock::new(InnerVirtIOBlkDevice {
-                device_inner,
+            inner: Mutex::new(InnerVirtIOBlkDevice {
                 name: None,
                 virtio_index: None,
                 device_common: DeviceCommonData::default(),
                 kobject_common: KObjectCommonData::default(),
                 irq,
             }),
-            parent: RwLock::new(Weak::default()),
-            fs: RwLock::new(Weak::default()),
+            blk: Mutex::new(blk),
+            submit_wq: WaitQueue::default(),
+            has_work: AtomicBool::new(false),
+            pending: Mutex::new(VecDeque::new()),
+            inflight: Mutex::new(HashMap::new()),
+            parent: RwSem::new(Weak::default()),
+            fs: RwSem::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
                 InodeMode::from_bits_truncate(0o755),
             ),
         });
 
+        // 启动 per-device worker（负责 submit + completion）
+        let arg = Arc::into_raw(dev.clone()) as usize;
+        let closure = KernelThreadClosure::UsizeClosure((
+            Box::new(|arg| -> i32 {
+                let dev = unsafe { Arc::from_raw(arg as *const VirtIOBlkDevice) };
+                dev.worker_loop()
+            }),
+            arg,
+        ));
+
+        log::debug!(
+            "create virtio_blk_{}_io thread: preempt_count: {}",
+            dev.blkdev_meta.devname.to_string(),
+            crate::process::ProcessManager::current_pcb().preempt_count()
+        );
+        let worker_pcb = KernelThreadMechanism::create_and_run(
+            closure,
+            format!("virtio_blk_{}_io", dev.blkdev_meta.devname.to_string()),
+        );
+
+        // This worker is latency-sensitive for mmap/filemap/readahead IO completion.
+        // Mark it so CFS can apply a wakeup-placement boost.
+        if let Some(pcb) = worker_pcb.as_ref() {
+            pcb.flags().insert(ProcessFlags::IO_WORKER);
+        }
+
         Some(dev)
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDevice> {
+    pub fn submit_bio(&self, bio: Arc<crate::driver::block::bio::Bio>) {
+        self.pending.lock().push_back(bio);
+        self.has_work.store(true, Ordering::Release);
+        self.submit_wq.wakeup(None);
+    }
+
+    fn worker_loop(&self) -> ! {
+        loop {
+            // NOTE: Avoid lost-wakeup races.
+            // Producers (submit_bio / IRQ) do:
+            //   pending.push; has_work=true; wakeup(worker)
+            // If the worker clears has_work with store(false) after an IRQ sets it true,
+            // the wake can be lost and the worker may sleep forever even though completions exist.
+            //
+            // Protocol:
+            // - Worker *consumes* the flag via swap(false)
+            // - Worker only sleeps when there is no visible work AND flag is false
+            // - Any concurrent producer setting has_work=true will be observed on next iteration
+
+            // Fast-path: if there is any visible work, do not sleep.
+            let has_pending = !self.pending.lock().is_empty();
+            let has_inflight = !self.inflight.lock().is_empty();
+            let has_used = {
+                let mut blk = self.blk.lock();
+                blk.peek_used().is_some()
+            };
+
+            if !has_pending && !has_inflight && !has_used {
+                // Consume any already-signaled work; otherwise sleep until signaled.
+                if !self.has_work.swap(false, Ordering::AcqRel) {
+                    let _ = self.submit_wq.wait_event_interruptible_timeout(
+                        || self.has_work.swap(false, Ordering::AcqRel),
+                        None,
+                    );
+                }
+            } else {
+                // Keep the loop running without sleeping.
+                let _ = self.has_work.swap(false, Ordering::AcqRel);
+            }
+
+            self.process_completions();
+            self.process_submissions();
+        }
+    }
+
+    fn process_completions(&self) {
+        loop {
+            let token = {
+                let mut blk = self.blk.lock();
+                // 必须确认（ack）设备中断，否则部分 transport 下中断状态不会清除，
+                // 也可能导致后续 used ring 的完成无法被及时观察到，从而让 bio.wait() 卡死。
+                // 注意：ack_interrupt 需要在进程上下文执行，避免在硬中断里做重锁/耗时操作。
+                let _ = blk.ack_interrupt();
+                blk.peek_used()
+            };
+            let Some(token) = token else { break };
+
+            let Some(mut inflight) = self.inflight.lock().remove(&token) else {
+                // 未知 token：尝试 pop 掉以避免 used ring 堵塞
+                let mut blk = self.blk.lock();
+                let dummy_req = BlkReq::default();
+                let mut dummy_resp = BlkResp::default();
+                let mut dummy_buf = [0u8; 512];
+                unsafe {
+                    let _ = blk.complete_read_blocks(
+                        token,
+                        &dummy_req,
+                        &mut dummy_buf,
+                        &mut dummy_resp,
+                    );
+                }
+                continue;
+            };
+
+            // pop_used + unshare（由 virtio-drivers 完成）
+            let r = {
+                let mut blk = self.blk.lock();
+                match inflight.op {
+                    crate::driver::block::bio::BioOp::Read => unsafe {
+                        blk.complete_read_blocks(
+                            token,
+                            &inflight.req,
+                            inflight.dma.as_mut_slice(),
+                            &mut *inflight.resp,
+                        )
+                    },
+                    crate::driver::block::bio::BioOp::Write => unsafe {
+                        blk.complete_write_blocks(
+                            token,
+                            &inflight.req,
+                            inflight.dma.as_slice(),
+                            &mut *inflight.resp,
+                        )
+                    },
+                    _ => Err(virtio_drivers::Error::Unsupported),
+                }
+            };
+
+            match r {
+                Ok(_) => {
+                    let ok = inflight.resp.status() == RespStatus::OK;
+                    if ok && inflight.op == crate::driver::block::bio::BioOp::Read {
+                        let _ = inflight.bio.scatter_from(inflight.dma.as_slice());
+                    }
+                    inflight.bio.complete(if ok {
+                        Ok(inflight.bytes)
+                    } else {
+                        Err(SystemError::EIO)
+                    });
+                }
+                Err(_) => inflight.bio.complete(Err(SystemError::EIO)),
+            }
+        }
+    }
+
+    fn process_submissions(&self) {
+        loop {
+            let bio = match self.pending.lock().pop_front() {
+                Some(b) => b,
+                None => break,
+            };
+
+            let bytes = match bio.count.checked_mul(LBA_SIZE) {
+                Some(b) => b,
+                None => {
+                    bio.complete(Err(SystemError::EOVERFLOW));
+                    continue;
+                }
+            };
+
+            let dma = match DmaBounce::new(bytes) {
+                Ok(d) => d,
+                Err(e) => {
+                    bio.complete(Err(e));
+                    continue;
+                }
+            };
+
+            let op = bio.op;
+            if op == crate::driver::block::bio::BioOp::Write {
+                if let Err(e) = bio.gather_to(dma.as_mut_slice()) {
+                    bio.complete(Err(e));
+                    continue;
+                }
+            }
+
+            let mut req = Box::new(BlkReq::default());
+            let mut resp = Box::new(BlkResp::default());
+
+            let token_res = {
+                let mut blk = self.blk.lock();
+                match bio.op {
+                    crate::driver::block::bio::BioOp::Read => unsafe {
+                        blk.read_blocks_nb(
+                            bio.lba_id_start,
+                            &mut *req,
+                            dma.as_mut_slice(),
+                            &mut *resp,
+                        )
+                    },
+                    crate::driver::block::bio::BioOp::Write => unsafe {
+                        blk.write_blocks_nb(bio.lba_id_start, &mut *req, dma.as_slice(), &mut *resp)
+                    },
+                    _ => Err(virtio_drivers::Error::Unsupported),
+                }
+            };
+
+            match token_res {
+                Ok(token) => {
+                    self.inflight.lock().insert(
+                        token,
+                        Inflight {
+                            bio,
+                            op,
+                            bytes,
+                            req,
+                            resp,
+                            dma,
+                        },
+                    );
+                }
+                Err(virtio_drivers::Error::QueueFull) => {
+                    // 队列满：放回 pending，等待 IRQ/完成后重试
+                    self.pending.lock().push_front(bio);
+                    break;
+                }
+                Err(_) => bio.complete(Err(SystemError::EIO)),
+            }
+        }
+    }
+
+    fn inner(&self) -> MutexGuard<'_, InnerVirtIOBlkDevice> {
         self.inner.lock()
     }
 }
@@ -244,7 +529,7 @@ impl IndexNode for VirtIOBlkDevice {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -253,7 +538,7 @@ impl IndexNode for VirtIOBlkDevice {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -274,7 +559,7 @@ impl IndexNode for VirtIOBlkDevice {
 
     fn close(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
@@ -286,7 +571,7 @@ impl IndexNode for VirtIOBlkDevice {
 
     fn open(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -313,9 +598,7 @@ impl BlockDevice for VirtIOBlkDevice {
     }
 
     fn disk_range(&self) -> GeneralBlockRange {
-        let inner = self.inner();
-        let blocks = inner.device_inner.capacity() as usize * SECTOR_SIZE / LBA_SIZE;
-        drop(inner);
+        let blocks = self.blk.lock().capacity() as usize * SECTOR_SIZE / LBA_SIZE;
         log::debug!(
             "VirtIOBlkDevice '{:?}' disk_range: 0..{}",
             self.dev_name(),
@@ -330,20 +613,24 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        let mut inner = self.inner();
+        if count == 0 {
+            return Ok(0);
+        }
+        let bytes = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        if bytes > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
 
-        inner
-            .device_inner
-            .read_blocks(lba_id_start, &mut buf[..count * LBA_SIZE])
-            .map_err(|e| {
-                error!(
-                    "VirtIOBlkDevice '{:?}' read_at_sync failed: {:?}",
-                    self.dev_id, e
-                );
-                SystemError::EIO
-            })?;
-
-        Ok(count)
+        // 用 Bio + Completion 走统一 Block IO 层（virtio-blk: async submit + IRQ/worker completion）
+        let bio = unsafe {
+            crate::driver::block::bio::Bio::new_read_borrowed(
+                lba_id_start,
+                count,
+                &mut buf[..bytes],
+            )?
+        };
+        self.submit_bio(bio.clone());
+        bio.wait()
     }
 
     fn write_at_sync(
@@ -352,14 +639,26 @@ impl BlockDevice for VirtIOBlkDevice {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.inner()
-            .device_inner
-            .write_blocks(lba_id_start, &buf[..count * LBA_SIZE])
-            .map_err(|_| SystemError::EIO)?;
-        Ok(count)
+        if count == 0 {
+            return Ok(0);
+        }
+        let bytes = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        if bytes > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let bio = unsafe {
+            crate::driver::block::bio::Bio::new_write_borrowed(lba_id_start, count, &buf[..bytes])?
+        };
+        self.submit_bio(bio.clone());
+        bio.wait()
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn submit_bio(&self, bio: alloc::sync::Arc<crate::driver::block::bio::Bio>) -> Result<(), SystemError> {
+        self.submit_bio(bio);
         Ok(())
     }
 
@@ -388,7 +687,6 @@ impl BlockDevice for VirtIOBlkDevice {
 }
 
 struct InnerVirtIOBlkDevice {
-    device_inner: VirtIOBlk<HalImpl, VirtIOTransport>,
     name: Option<String>,
     virtio_index: Option<VirtIODeviceIndex>,
     device_common: DeviceCommonData,
@@ -411,7 +709,10 @@ impl VirtIODevice for VirtIOBlkDevice {
         &self,
         _irq: crate::exception::IrqNumber,
     ) -> Result<IrqReturn, system_error::SystemError> {
-        // todo: handle virtio blk irq
+        // 中断处理：唤醒 worker 线程处理完成的 I/O
+        // worker 会在进程上下文中处理 ack_interrupt 和 completion
+        self.has_work.store(true, Ordering::Release);
+        self.submit_wq.wakeup(None);
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }
 
@@ -592,7 +893,7 @@ fn virtio_blk_driver_init() -> Result<(), SystemError> {
 #[cast_to([sync] VirtIODriver)]
 #[cast_to([sync] Driver)]
 struct VirtIOBlkDriver {
-    inner: SpinLock<InnerVirtIOBlkDriver>,
+    inner: Mutex<InnerVirtIOBlkDriver>,
     kobj_state: LockedKObjectState,
 }
 
@@ -609,7 +910,7 @@ impl VirtIOBlkDriver {
             VIRTIO_VENDOR_ID.into(),
         );
         let result = VirtIOBlkDriver {
-            inner: SpinLock::new(inner),
+            inner: Mutex::new(inner),
             kobj_state: LockedKObjectState::default(),
         };
         result.add_virtio_id(id_table);
@@ -617,7 +918,7 @@ impl VirtIOBlkDriver {
         return Arc::new(result);
     }
 
-    fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOBlkDriver> {
+    fn inner(&self) -> MutexGuard<'_, InnerVirtIOBlkDriver> {
         return self.inner.lock();
     }
 }

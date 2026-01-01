@@ -11,7 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
     mm::MemoryManagementArch,
     process::{ProcessManager, RawPid},
 };
@@ -42,7 +42,7 @@ impl FileOps for StatmFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 查找进程
         let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;

@@ -5,7 +5,7 @@ use crate::{
         epoll::EPollEventType,
         vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata, PollableInode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
 };
 
 use alloc::sync::Arc;
@@ -37,7 +37,7 @@ impl IndexNode for EPollInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -47,7 +47,7 @@ impl IndexNode for EPollInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -68,7 +68,7 @@ impl IndexNode for EPollInode {
         Ok(Metadata::default())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 释放资源
         let mut epoll = self.epoll.0.lock_irqsave();
 
@@ -79,7 +79,7 @@ impl IndexNode for EPollInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())

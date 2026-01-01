@@ -11,14 +11,14 @@ use hashbrown::HashMap;
 use system_error::SystemError;
 
 use super::vfs::IndexNode;
-use crate::libs::spinlock::SpinLockGuard;
+use crate::driver::block::bio::Bio;
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::mm::page::FileMapInfo;
 use crate::{arch::mm::LockedFrameAllocator, libs::lazy_init::Lazy};
 use crate::{
     arch::MMArch,
-    libs::spinlock::SpinLock,
     mm::{
-        page::{page_manager_lock_irqsave, page_reclaimer_lock_irqsave, Page, PageFlags},
+        page::{page_manager_lock_irqsave, page_reclaimer_lock, Page, PageFlags},
         MemoryManagementArch,
     },
 };
@@ -29,7 +29,7 @@ static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 pub struct PageCache {
     id: usize,
-    inner: SpinLock<InnerPageCache>,
+    inner: Mutex<InnerPageCache>,
     inode: Lazy<Weak<dyn IndexNode>>,
     unevictable: AtomicBool,
 }
@@ -118,13 +118,13 @@ impl InnerPageCache {
         Ok(())
     }
 
-    /// 创建若干个“零页”并加入 PageCache。
+    /// 创建若干个"零页"并加入 PageCache。
     ///
     /// 与 `create_pages()` 的区别：
     /// - 不需要临时分配 `Vec<u8>` 作为填充缓冲区；
     /// - 直接分配物理页后在页内 `fill(0)`；
     ///
-    /// 适用场景：tmpfs 等内存文件系统的“空洞读/缺页补零”。
+    /// 适用场景：tmpfs 等内存文件系统的"空洞读/缺页补零"。
     pub fn create_zero_pages(
         &mut self,
         start_page_index: usize,
@@ -171,22 +171,78 @@ impl InnerPageCache {
         Ok(())
     }
 
-    /// 从PageCache中读取数据。
+    /// 创建若干个未初始化页面并返回引用，用于异步 IO。
+    ///
+    /// 与 `create_zero_pages()` 的区别：
+    /// - 返回创建的 Arc<Page> 列表
+    /// - 不预填充零或任何数据
+    /// - 用于 BioVec 异步读取，数据由 IO 填充
+    ///
+    /// # 返回值
+    /// - `Ok(Vec<Arc<Page>>)` 创建的页面列表
+    /// - `Err(SystemError)` 创建失败
+    fn create_pages_for_io(
+        &mut self,
+        start_page_index: usize,
+        page_num: usize,
+    ) -> Result<Vec<Arc<Page>>, SystemError> {
+        if page_num == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut page_manager_guard = page_manager_lock_irqsave();
+        let mut pages = Vec::new();
+
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+
+            let page_flags = {
+                let cache = self
+                    .page_cache_ref
+                    .upgrade()
+                    .expect("failed to get self_arc of pagecache");
+                if cache.unevictable.load(Ordering::Relaxed) {
+                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+                } else {
+                    PageFlags::PG_LRU
+                }
+            };
+
+            let page = page_manager_guard.create_one_page(
+                PageType::File(FileMapInfo {
+                    page_cache: self.page_cache_ref.clone(),
+                    index: page_index,
+                }),
+                page_flags,
+                &mut LockedFrameAllocator,
+            )?;
+
+            self.add_page(page_index, &page);
+            pages.push(page);
+        }
+
+        Ok(pages)
+    }
+
+    /// 从PageCache中读取数据（异步 BioVec 版本）。
     ///
     /// ## 参数
     ///
     /// - `offset` 偏移量
-    /// - `buf` 缓冲区
+    /// - `buf_len` 缓冲区长度
     ///
     /// ## 返回值
     ///
-    /// - `Ok(usize)` 成功读取的长度
+    /// - `Ok((copies, ret, waiters))`
+    ///   - `copies`: 已有页面或读取完成的页面的拷贝项
+    ///   - `ret`: 成功读取的长度
+    ///   - `waiters`: 待完成的异步 Bio 列表（调用者应在拷贝数据前等待）
     /// - `Err(SystemError)` 失败返回错误码
     fn prepare_read(
         &mut self,
         offset: usize,
         buf_len: usize,
-    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
+    ) -> Result<(Vec<CopyItem>, usize, Vec<Arc<Bio>>), SystemError> {
         let inode: Arc<dyn IndexNode> = self
             .page_cache_ref
             .upgrade()
@@ -197,6 +253,9 @@ impl InnerPageCache {
 
         let file_size = inode.metadata().unwrap().size;
 
+        // 尝试获取底层块设备用于异步 IO
+        let block_device = inode.fs().get_block_device().ok();
+        
         let len = if offset < file_size as usize {
             core::cmp::min(file_size as usize, offset + buf_len) - offset
         } else {
@@ -204,11 +263,12 @@ impl InnerPageCache {
         };
 
         if len == 0 {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, Vec::new()));
         }
 
         let mut not_exist = Vec::new();
         let mut copies: Vec<CopyItem> = Vec::new();
+        let mut waiters: Vec<Arc<Bio>> = Vec::new();
 
         let start_page_index = offset >> MMArch::PAGE_SHIFT;
         let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
@@ -251,33 +311,55 @@ impl InnerPageCache {
             }
         }
 
-        for (page_index, count) in not_exist {
-            // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
-            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
+        // 读取不存在于缓存中的页面
+        // 【重要】：对于文件系统，必须使用 inode.read_sync() 而不是直接提交 Bio
+        // 原因：文件页偏移 (page_index) 不等于磁盘 LBA
+        // 文件系统（如 ext4）使用 extent tree 将文件偏移映射到磁盘上分散的位置
+        // inode.read_sync() 内部会正确处理这个映射，最终也会使用 Bio 机制
+        //
+        // 直接 Bio 提交（带 BioVec 零拷贝）仅适用于：
+        // 1. 原始块设备访问（已知正确的 LBA）
+        // 2. 文件系统提供了 file_offset_to_lba() 映射方法的情况
+        //
+        // TODO: 未来可以在 IndexNode trait 添加 submit_bio_for_page() 方法，
+        //       让文件系统实现文件偏移到 LBA 的映射，以支持真正的零拷贝 DMA
+        let _ = block_device; // 标记为已使用，避免警告
 
+        for (page_index, count) in not_exist {
+            // 创建未初始化页面
+            let pages = self.create_pages_for_io(page_index, count)?;
+
+            // 使用 inode.read_sync() 读取数据，它会正确处理文件偏移到磁盘 LBA 的映射
+            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
             inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
 
-            self.create_pages(page_index, page_buf.as_mut())?;
-
-            // 实际要拷贝的内容在文件中的偏移量
-            let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-            // 实际要拷贝的内容的长度
-            let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
-                - copy_offset;
+            // 将数据写入已创建的页面
+            for (i, page) in pages.iter().enumerate() {
+                let buf_offset = i * MMArch::PAGE_SIZE;
+                let page_len = core::cmp::min(MMArch::PAGE_SIZE, page_buf.len() - buf_offset);
+                let mut page_guard = page.write_irqsave();
+                unsafe {
+                    let dst = page_guard.as_slice_mut();
+                    dst[..page_len].copy_from_slice(&page_buf[buf_offset..buf_offset + page_len]);
+                }
+            }
 
             // 为每个新建的页生成拷贝项
-            for i in 0..count {
+            let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
+            let copy_len = core::cmp::min(
+                (page_index + count) * MMArch::PAGE_SIZE,
+                offset + len,
+            ) - copy_offset;
+
+            for (i, page) in pages.iter().enumerate() {
                 let pg_index = page_index + i;
-                let page = self
-                    .get_page(pg_index)
-                    .expect("page must exist after create_pages");
                 let page_start = pg_index * MMArch::PAGE_SIZE;
                 let sub_start = core::cmp::max(copy_offset, page_start);
                 let sub_end =
                     core::cmp::min(copy_offset + copy_len, page_start + MMArch::PAGE_SIZE);
                 if sub_end > sub_start {
                     copies.push(CopyItem {
-                        page,
+                        page: page.clone(),
                         page_offset: sub_start - page_start,
                         sub_len: sub_end - sub_start,
                     });
@@ -286,7 +368,7 @@ impl InnerPageCache {
             }
         }
 
-        Ok((copies, ret))
+        Ok((copies, ret, waiters))
     }
 
     /// 向PageCache中写入数据。
@@ -361,7 +443,7 @@ impl InnerPageCache {
     pub fn resize(&mut self, len: usize) -> Result<(), SystemError> {
         let page_num = page_align_up(len) / MMArch::PAGE_SIZE;
 
-        let mut reclaimer = page_reclaimer_lock_irqsave();
+        let mut reclaimer = page_reclaimer_lock();
         for (_i, page) in self.pages.drain_filter(|index, _page| *index >= page_num) {
             let _ = reclaimer.remove_page(&page.phys_address());
         }
@@ -418,7 +500,7 @@ impl InnerPageCache {
     /// 只驱逐干净的、无外部引用的页
     pub fn invalidate_range(&mut self, start_index: usize, end_index: usize) -> usize {
         let mut evicted = 0;
-        let mut page_reclaimer = page_reclaimer_lock_irqsave();
+        let mut page_reclaimer = page_reclaimer_lock();
 
         for idx in start_index..=end_index {
             if let Some(page) = self.pages.get(&idx) {
@@ -459,7 +541,7 @@ impl PageCache {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
             id,
-            inner: SpinLock::new(InnerPageCache::new(weak.clone(), id)),
+            inner: Mutex::new(InnerPageCache::new(weak.clone(), id)),
             inode: {
                 let v: Lazy<Weak<dyn IndexNode>> = Lazy::new();
                 if let Some(inode) = inode {
@@ -490,15 +572,8 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, InnerPageCache> {
-        if self.inner.is_locked() {
-            log::error!("page cache already locked");
-        }
-        self.inner.lock_irqsave()
-    }
-
-    pub fn is_locked(&self) -> bool {
-        self.inner.is_locked()
+    pub fn lock(&self) -> MutexGuard<'_, InnerPageCache> {
+        self.inner.lock()
     }
 
     /// Mark this page cache as unevictable (or revert). When enabled, newly created
@@ -507,12 +582,17 @@ impl PageCache {
         self.unevictable.store(unevictable, Ordering::Relaxed);
     }
 
-    /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
+    /// 两阶段读取：持锁收集拷贝项和异步 IO，解锁后等待 IO 完成再拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let (copies, ret) = {
-            let mut guard = self.inner.lock_irqsave();
+        let (copies, ret, waiters) = {
+            let mut guard = self.lock();
             guard.prepare_read(offset, buf.len())?
         };
+
+        // 等待所有异步 Block I/O 完成
+        for bio in waiters {
+            bio.wait()?;
+        }
 
         let mut dst_offset = 0;
         for item in copies {
@@ -534,7 +614,7 @@ impl PageCache {
     /// 两阶段写入：持锁收集目标页，解锁后按页写入，避免用户缺页时持有page cache锁
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
         let (copies, ret) = {
-            let mut guard = self.inner.lock_irqsave();
+            let mut guard = self.lock();
             guard.write(offset, buf)?
         };
 

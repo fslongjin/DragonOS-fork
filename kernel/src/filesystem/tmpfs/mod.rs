@@ -17,7 +17,7 @@ use crate::{
     filesystem::vfs::{vcore::generate_inode_id, FileType},
     ipc::pipe::LockedPipeInode,
     libs::casting::DowncastArc,
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{mutex::MutexGuard, spinlock::{SpinLock, SpinLockGuard}},
     mm::MemoryManagementArch,
     time::PosixTimeSpec,
 };
@@ -433,13 +433,13 @@ impl IndexNode for LockedTmpfsInode {
         self.resize(len)
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &super::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -450,7 +450,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -487,7 +487,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<ReadItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -546,7 +546,7 @@ impl IndexNode for LockedTmpfsInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if buf.len() < len {
             return Err(SystemError::EINVAL);
@@ -591,7 +591,7 @@ impl IndexNode for LockedTmpfsInode {
 
         let mut items: Vec<WriteItem> = Vec::new();
         {
-            let mut page_cache_guard = page_cache.lock_irqsave();
+            let mut page_cache_guard = page_cache.lock();
             for page_index in start_page_index..=end_page_index {
                 let page_start = page_index * MMArch::PAGE_SIZE;
                 let page_end = page_start + MMArch::PAGE_SIZE;
@@ -693,7 +693,7 @@ impl IndexNode for LockedTmpfsInode {
 
             // 调整页缓存（会释放多余页，并截断最后一页）
             if let Some(pc) = inode.page_cache.clone() {
-                pc.lock_irqsave().resize(len)?;
+                pc.lock().resize(len)?;
             }
 
             // 如果缩小，减少current_size

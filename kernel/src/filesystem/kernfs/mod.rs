@@ -15,6 +15,7 @@ use crate::{
     filesystem::vfs::syscall::RenameFlags,
     libs::{
         casting::DowncastArc,
+        mutex::{Mutex, MutexGuard},
         rwlock::RwLock,
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -169,7 +170,7 @@ impl IndexNode for KernFSInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         if let Some(callback) = self.callback {
@@ -181,7 +182,7 @@ impl IndexNode for KernFSInode {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -363,7 +364,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type == KernInodeType::SymLink {
             let inner = self.inner.read();
@@ -409,7 +410,7 @@ impl IndexNode for KernFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if self.inode_type != KernInodeType::File {
             return Err(SystemError::EISDIR);

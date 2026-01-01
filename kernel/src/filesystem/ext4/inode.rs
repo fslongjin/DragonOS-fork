@@ -8,7 +8,8 @@ use crate::{
     },
     libs::{
         casting::DowncastArc,
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::MutexGuard,
+        spinlock::SpinLock,
     },
     time::PosixTimeSpec,
 };
@@ -25,7 +26,7 @@ use system_error::SystemError;
 
 use super::filesystem::Ext4FileSystem;
 
-type PrivateData<'a> = crate::libs::spinlock::SpinLockGuard<'a, vfs::FilePrivateData>;
+type PrivateData<'a> = crate::libs::mutex::MutexGuard<'a, vfs::FilePrivateData>;
 
 pub struct Ext4Inode {
     // 对应another_ext4里面的inode号，用于在ext4文件系统中查找相应的inode
@@ -55,7 +56,7 @@ impl IndexNode for LockedExt4Inode {
 
     fn open(
         &self,
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
         _mode: &vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
@@ -173,7 +174,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<vfs::FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.read_sync(offset, &mut buf[0..len])
@@ -245,7 +246,7 @@ impl IndexNode for LockedExt4Inode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let len = core::cmp::min(len, buf.len());
         self.write_sync(offset, &buf[0..len])

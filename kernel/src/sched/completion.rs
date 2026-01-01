@@ -4,7 +4,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::{
-        spinlock::SpinLock,
+        mutex::Mutex,
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
@@ -16,13 +16,13 @@ const MAX_TIMEOUT: i64 = i64::MAX;
 
 #[derive(Debug)]
 pub struct Completion {
-    inner: SpinLock<InnerCompletion>,
+    inner: Mutex<InnerCompletion>,
 }
 
 impl Completion {
     pub const fn new() -> Self {
         Self {
-            inner: SpinLock::new(InnerCompletion::new()),
+            inner: Mutex::new(InnerCompletion::new()),
         }
     }
 
@@ -44,7 +44,7 @@ impl Completion {
         loop {
             // 快路径：已完成直接消费
             {
-                let mut inner = self.inner.lock_irqsave();
+                let mut inner = self.inner.lock();
                 if inner.done != 0 {
                     if inner.done != COMPLETE_ALL {
                         inner.done = inner.done.saturating_sub(1);
@@ -74,7 +74,7 @@ impl Completion {
 
             // 注册 waker，并在注册前后都检查 done 以避免丢唤醒
             {
-                let mut inner = self.inner.lock_irqsave();
+                let mut inner = self.inner.lock();
                 if inner.done != 0 {
                     if inner.done != COMPLETE_ALL {
                         inner.done = inner.done.saturating_sub(1);
@@ -109,7 +109,7 @@ impl Completion {
 
             // 从队列摘除自身（若还在）
             {
-                let inner = self.inner.lock_irqsave();
+                let inner = self.inner.lock();
                 inner.wait_queue.remove_waker(&waiter.waker());
             }
 
@@ -153,7 +153,7 @@ impl Completion {
 
     /// @brief 唤醒一个wait_queue中的节点
     pub fn complete(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         if inner.done != COMPLETE_ALL {
             inner.done = inner.done.saturating_add(1);
         }
@@ -163,7 +163,7 @@ impl Completion {
 
     /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
     pub fn complete_all(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.done = COMPLETE_ALL;
         inner.wait_queue.wakeup_all(None);
         // 脱离生命周期，自动释放guard
@@ -174,7 +174,7 @@ impl Completion {
     /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
     /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
     pub fn try_wait_for_completion(&mut self) -> bool {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         if inner.done == 0 {
             return false;
         }
@@ -190,7 +190,7 @@ impl Completion {
 
     // @brief 测试一个completion是否有waiter。（即done是不是等于0）
     pub fn completion_done(&self) -> bool {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         if inner.done == 0 {
             return false;
         }

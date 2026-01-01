@@ -12,7 +12,8 @@ use crate::{
     },
     ipc::signal_types::SigCode,
     libs::{
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::MutexGuard,
+        spinlock::SpinLock,
         wait_queue::WaitQueue,
     },
     mm::MemoryManagementArch,
@@ -414,7 +415,7 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &mut [u8],
-        data_guard: SpinLockGuard<FilePrivateData>,
+        data_guard: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let data = data_guard.clone();
         drop(data_guard);
@@ -504,7 +505,7 @@ impl IndexNode for LockedPipeInode {
 
     fn open(
         &self,
-        mut data: SpinLockGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
         flags: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         let accflags = flags.access_flags();
@@ -640,7 +641,7 @@ impl IndexNode for LockedPipeInode {
         return Ok(inode.metadata.clone());
     }
 
-    fn close(&self, data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         let flags: FileFlags;
         if let FilePrivateData::Pipefs(pipe_data) = &*data {
             flags = pipe_data.flags;
@@ -731,7 +732,7 @@ impl IndexNode for LockedPipeInode {
         _offset: usize,
         len: usize,
         buf: &[u8],
-        data: SpinLockGuard<FilePrivateData>,
+        data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 获取flags
         let flags: FileFlags;

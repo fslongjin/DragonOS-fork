@@ -11,7 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
 };
 use alloc::{
     format,
@@ -113,7 +113,7 @@ impl FileOps for PrintkFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::read_config();
         proc_read(offset, len, buf, content.as_bytes())
@@ -124,7 +124,7 @@ impl FileOps for PrintkFileOps {
         _offset: usize,
         _len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Self::write_config(buf)
     }

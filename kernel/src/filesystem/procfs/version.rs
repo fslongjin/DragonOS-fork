@@ -56,7 +56,7 @@ impl FileOps for VersionFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::generate_version_content();
         proc_read(offset, len, buf, &content)

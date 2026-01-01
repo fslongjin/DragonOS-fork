@@ -10,7 +10,10 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{
+        mutex::MutexGuard,
+        spinlock::SpinLockGuard,
+    },
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -34,7 +37,7 @@ impl FileOps for KmsgFileOps {
         _offset: usize,
         _len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // 访问全局 KMSG 缓冲区
         let kmsg = unsafe { KMSG.as_ref().ok_or(SystemError::ENODEV)? };

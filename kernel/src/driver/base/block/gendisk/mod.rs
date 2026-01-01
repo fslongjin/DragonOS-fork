@@ -19,7 +19,7 @@ use crate::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         vfs::{utils::DName, IndexNode, InodeMode, Metadata},
     },
-    libs::{rwlock::RwLock, spinlock::SpinLockGuard},
+    libs::{mutex::MutexGuard, rwsem::RwSem},
 };
 
 const MINORS_PER_DISK: u32 = 256;
@@ -33,8 +33,8 @@ pub struct GenDisk {
 
     device_num: DeviceNumber,
 
-    parent: RwLock<Weak<LockedDevFSInode>>,
-    fs: RwLock<Weak<DevFS>>,
+    parent: RwSem<Weak<LockedDevFSInode>>,
+    fs: RwSem<Weak<DevFS>>,
     metadata: Metadata,
     /// 对应/dev/下的设备名
     name: DName,
@@ -71,8 +71,8 @@ impl GenDisk {
             block_size_log2: bsizelog2,
             idx,
             device_num,
-            parent: RwLock::new(Weak::default()),
-            fs: RwLock::new(Weak::default()),
+            parent: RwSem::new(Weak::default()),
+            fs: RwSem::new(Weak::default()),
             metadata: Metadata::new(
                 crate::filesystem::vfs::FileType::BlockDevice,
                 InodeMode::from_bits_truncate(0o755),
@@ -225,7 +225,7 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);
@@ -241,7 +241,7 @@ impl IndexNode for GenDisk {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         if len == 0 {
             return Ok(0);
@@ -286,14 +286,14 @@ impl IndexNode for GenDisk {
 
     fn close(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn open(
         &self,
-        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+        _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())

@@ -34,6 +34,7 @@ use crate::{
     },
     init::initcall::INITCALL_SUBSYS,
     libs::{
+        mutex::MutexGuard,
         rwlock::RwLock,
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
@@ -405,13 +406,13 @@ impl DeviceINode for FbDevice {
 impl IndexNode for FbDevice {
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         Ok(())
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         Ok(())
     }
     fn read_at(
@@ -419,7 +420,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_read(&mut buf[0..len], offset);
@@ -430,7 +431,7 @@ impl IndexNode for FbDevice {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let fb = self.inner.lock().fb.upgrade().unwrap();
         return fb.fb_write(&buf[0..len], offset);

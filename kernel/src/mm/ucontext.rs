@@ -30,7 +30,7 @@ use crate::{
     ipc::shm::{ShmFlags, ShmId},
     libs::{
         align::page_align_up,
-        rwlock::RwLock,
+        rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{page::page_manager_lock_irqsave, PhysAddr},

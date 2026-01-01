@@ -53,7 +53,7 @@ pub unsafe fn lookup_kallsyms(addr: u64, level: i32) -> bool {
             addr
         );
     };
-    return is_kernel_main;
+    is_kernel_main
 }
 
 /// Get the address of the symbol

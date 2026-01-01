@@ -804,6 +804,15 @@ impl CfsRunQueue {
 
     /// 为调度实体计算初始vruntime等信息
     fn place_entity(&mut self, se: Arc<FairSchedEntity>, flags: EnqueueFlag) {
+        // For latency-sensitive kernel IO workers, make wakeups more likely to preempt
+        // by placing them at the current min_vruntime.
+        //
+        // IMPORTANT: do not place below min_vruntime, since DragonOS' min_vruntime is
+        // monotonic (doesn't decrease) and going below it breaks invariants.
+        let io_worker_wakeup_boost = flags.contains(EnqueueFlag::ENQUEUE_WAKEUP)
+            && se.is_task()
+            && se.pcb().flags().contains(ProcessFlags::IO_WORKER);
+
         let vruntime = self.avg_vruntime();
         let mut lag = 0;
 
@@ -835,6 +844,10 @@ impl CfsRunQueue {
         }
 
         se.vruntime = vruntime - lag as u64;
+
+        if io_worker_wakeup_boost {
+            se.vruntime = self.min_vruntime;
+        }
 
         if flags.contains(EnqueueFlag::ENQUEUE_INITIAL) {
             vslice /= 2;

@@ -124,8 +124,12 @@ impl PageFaultHandler {
         let flags = pfm.flags();
         let vma = pfm.vma();
         let current_pcb = ProcessManager::current_pcb();
-        let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
-        guard.set_state(ProcessState::Runnable);
+        // 【重要】：设置状态后立即释放锁，不要让 irqsave 锁跨越整个函数
+        // 否则后续的 Block I/O 需要中断来完成，会导致死锁
+        {
+            let mut guard = current_pcb.sched_info().inner_lock_write_irqsave();
+            guard.set_state(ProcessState::Runnable);
+        } // guard 在此处释放，恢复中断状态
 
         if !MMArch::vma_access_permitted(
             vma.clone(),
@@ -346,13 +350,16 @@ impl PageFaultHandler {
         let cache_page = pfm.page.clone().unwrap();
         let mapper = &mut pfm.mapper;
 
-        let mut page_manager_guard = page_manager_lock_irqsave();
-        if let Ok(page) =
-            page_manager_guard.copy_page(&cache_page.phys_address(), mapper.allocator_mut())
         {
-            pfm.cow_page = Some(page.clone());
-        } else {
-            return VmFaultReason::VM_FAULT_OOM;
+            let mut page_manager_guard = page_manager_lock_irqsave();
+            if let Ok(page) =
+                page_manager_guard.copy_page(&cache_page.phys_address(), mapper.allocator_mut())
+            {
+                pfm.cow_page = Some(page.clone());
+            } else {
+                return VmFaultReason::VM_FAULT_OOM;
+            }
+            // page_manager_guard 在此处释放，避免在 finish_fault() 中持有自旋锁
         }
         ret = ret.union(Self::finish_fault(pfm));
 
@@ -381,8 +388,8 @@ impl PageFaultHandler {
             return ret;
         }
 
-        // 出现错误类返回时，不再继续 finish_fault 以避免 unwrap/panic
-        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+        // 出现错误类返回或需要重试时，不再继续 finish_fault
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR | VmFaultReason::VM_FAULT_RETRY) {
             return ret;
         }
 
@@ -403,7 +410,8 @@ impl PageFaultHandler {
     pub unsafe fn do_shared_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let mut ret = Self::filemap_fault(pfm);
 
-        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
+        // 出现错误或需要重试时，直接返回
+        if ret.intersects(VmFaultReason::VM_FAULT_ERROR | VmFaultReason::VM_FAULT_RETRY) {
             return ret;
         }
 
@@ -652,7 +660,7 @@ impl PageFaultHandler {
                 << MMArch::PAGE_SHIFT);
 
         for pgoff in start_pgoff..end_pgoff {
-            if let Some(page) = page_cache.lock_irqsave().get_page(pgoff) {
+            if let Some(page) = page_cache.lock().get_page(pgoff) {
                 let page_guard = page.read_irqsave();
                 if page_guard.flags().contains(PageFlags::PG_UPTODATE) {
                     let phys = page.phys_address();
@@ -677,10 +685,16 @@ impl PageFaultHandler {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
+    ///
+    /// ## 设计说明
+    ///
+    /// 为避免在持有地址空间锁时进行 Block I/O（会导致 preempt_count != 0 时调用 schedule() 而 panic），
+    /// 本函数在页面不在缓存中时返回 VM_FAULT_RETRY，由调用者在释放锁后进行预取，然后重试。
     pub unsafe fn filemap_fault(pfm: &mut PageFaultMessage) -> VmFaultReason {
         let vma = pfm.vma();
         let vma_guard = vma.lock_irqsave();
         let file = vma_guard.vm_file().expect("no vm_file in vma");
+        drop(vma_guard);
         let page_cache = match file.inode().page_cache() {
             Some(cache) => cache,
             None => {
@@ -693,50 +707,24 @@ impl PageFaultHandler {
             }
         };
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
-        let mut ret = VmFaultReason::empty();
 
-        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
+        // 检查页面是否已在缓存中
+        let page = page_cache.lock().get_page(backing_pgoff);
         if let Some(page) = page {
-            // TODO 异步从磁盘中预读页面进PageCache
-
-            // 直接将PageCache中的页面作为要映射的页面
+            // 页面已在缓存中，直接使用
             pfm.page = Some(page.clone());
-        } else {
-            // TODO 同步预读
-            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            match file.pread(
-                backing_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                buffer.as_mut_slice(),
-            ) {
-                Ok(read_len) => {
-                    // 超出文件末尾，返回SIGBUS而不是panic
-                    if read_len == 0 {
-                        return VmFaultReason::VM_FAULT_SIGBUS;
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        backing_pgoff,
-                        e
-                    );
-                    return VmFaultReason::VM_FAULT_SIGBUS;
-                }
-            }
-            drop(buffer);
-
-            let page = page_cache.lock_irqsave().get_page(backing_pgoff);
-            if let Some(page) = page {
-                pfm.page = Some(page);
-            } else {
-                // 读取后仍未获取到页面，视为错误
-                return VmFaultReason::VM_FAULT_SIGBUS;
-            }
+            return VmFaultReason::empty();
         }
-        ret
+
+        // 页面不在缓存中，需要进行 I/O
+        // 返回 VM_FAULT_RETRY，由调用者在释放地址空间锁后进行预取
+        // 这样可以避免在持有锁时调用 schedule()
+        // log::debug!(
+        //     "filemap_fault: page not in cache, returning VM_FAULT_RETRY, pgoff={}, address={:#x}",
+        //     backing_pgoff,
+        //     pfm.address().data()
+        // );
+        VmFaultReason::VM_FAULT_RETRY
     }
 
     /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。
@@ -772,7 +760,7 @@ impl PageFaultHandler {
         }
 
         // 先尝试直接获取
-        if let Some(page) = page_cache.lock_irqsave().get_page(backing_pgoff) {
+        if let Some(page) = page_cache.lock().get_page(backing_pgoff) {
             // 标记为 UPTODATE，便于 map_pages / readahead（即便对 tmpfs 通常不会走）。
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);
@@ -780,12 +768,12 @@ impl PageFaultHandler {
         }
 
         {
-            let mut pc = page_cache.lock_irqsave();
+            let mut pc = page_cache.lock();
             // 可能并发创建：create 后再 get（忽略已存在/并发导致的轻微差异）
             pc.create_zero_pages(backing_pgoff, 1).map_err(|_| ()).ok();
         }
 
-        let page = page_cache.lock_irqsave().get_page(backing_pgoff);
+        let page = page_cache.lock().get_page(backing_pgoff);
         if let Some(page) = page {
             page.write_irqsave().add_flags(PageFlags::PG_UPTODATE);
             pfm.page = Some(page);

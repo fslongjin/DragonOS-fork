@@ -29,7 +29,7 @@ use crate::{
     ipc::pipe::LockedPipeInode,
     libs::{
         casting::DowncastArc,
-        spinlock::{SpinLock, SpinLockGuard},
+        mutex::{Mutex, MutexGuard},
     },
     mm::{fault::PageFaultMessage, VmFaultReason},
     net::socket::Socket,
@@ -378,7 +378,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
@@ -389,7 +389,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 若文件系统没有实现此方法，则返回“不支持”
         return Err(SystemError::ENOSYS);
     }
@@ -409,7 +409,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
@@ -426,7 +426,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError>;
 
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
@@ -447,7 +447,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -457,20 +457,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// ## 参数
     ///
     /// - `offset`: 起始位置在Inode中的偏移量
-    /// - `len`: 要读取的字节数
+    /// - `len`: 要写入的字节数
     /// - `buf`: 缓冲区
     /// - `data`: 各文件系统系统所需私有信息
     ///
     /// ## 返回值
     ///
-    /// - `Ok(usize)``: Ok(读取的字节数)
+    /// - `Ok(usize)``: Ok(写入的字节数)
     /// - `Err(SystemError)``: Err(Posix错误码)
     fn write_direct(
         &self,
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
     }
@@ -771,7 +771,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn datasync(&self) -> Result<(), SystemError> {
         let page_cache = self.page_cache();
         if let Some(page_cache) = page_cache {
-            return page_cache.lock_irqsave().sync();
+            return page_cache.lock().sync();
         }
         Ok(())
     }
@@ -1111,7 +1111,7 @@ impl dyn IndexNode {
                     0,
                     256,
                     &mut content,
-                    SpinLock::new(FilePrivateData::Unused).lock(),
+                    Mutex::new(FilePrivateData::Unused).lock(),
                 )?;
 
                 // 将读到的数据转换为utf8字符串（先转为str，再转为String）
@@ -1308,6 +1308,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     fn name(&self) -> &str;
 
     fn super_block(&self) -> SuperBlock;
+
+    /// @brief 获取当前文件系统对应的块设备
+    ///
+    /// 对于磁盘文件系统（如 ext4、fat），返回对应的块设备。
+    /// 对于内存文件系统（如 tmpfs、ramfs），返回 None 或 Err。
+    fn get_block_device(&self) -> Result<alloc::sync::Arc<dyn crate::driver::base::block::block_device::BlockDevice>, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
 
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS

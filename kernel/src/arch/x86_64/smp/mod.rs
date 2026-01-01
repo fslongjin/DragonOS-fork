@@ -204,6 +204,7 @@ impl SMPArch for X86_64SMPArch {
     }
 
     fn post_init() -> Result<(), SystemError> {
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         // AP核心启动完毕，取消低地址映射
         unsafe {
             LowAddressRemapping::unmap_at_low_address(

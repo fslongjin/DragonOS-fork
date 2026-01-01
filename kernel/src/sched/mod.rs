@@ -828,6 +828,7 @@ pub fn scheduler_tick() {
 #[inline]
 pub fn schedule(sched_mod: SchedMode) {
     let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    
     assert_eq!(ProcessManager::current_pcb().preempt_count(), 0);
     __schedule(sched_mod);
 }

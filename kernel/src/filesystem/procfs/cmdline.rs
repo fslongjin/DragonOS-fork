@@ -52,7 +52,7 @@ impl FileOps for CmdlineFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let content = Self::generate_cmdline_content();
 

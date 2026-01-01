@@ -11,7 +11,7 @@ use crate::{
             IndexNode, InodeId, InodeMode,
         },
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
     process::{
         namespace::{nsproxy::NamespaceId, NamespaceOps},
         ProcessManager,
@@ -249,7 +249,7 @@ impl SymOps for ThreadSelfNsSymOps {
         Some(InodeId::new(current_thread_self_ns_ino(self.ns_type)))
     }
 
-    fn open(&self, data: &mut SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(&self, data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         // 当打开命名空间文件时，设置命名空间私有数据
         // 这使得 setns() 可以使用这个 fd
         let pcb = ProcessManager::current_pcb();

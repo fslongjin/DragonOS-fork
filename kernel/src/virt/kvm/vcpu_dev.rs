@@ -7,7 +7,7 @@ use crate::filesystem::vfs::{
     core::generate_inode_id, file::FileMode, FilePrivateData, FileSystem, FileType, IndexNode,
     Metadata,
 };
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::mm::VirtAddr;
 use crate::syscall::user_access::copy_from_user;
 use crate::virt::kvm::vcpu::Vcpu;
@@ -100,14 +100,14 @@ impl IndexNode for LockedVcpuInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -200,7 +200,7 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -211,7 +211,7 @@ impl IndexNode for LockedVcpuInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

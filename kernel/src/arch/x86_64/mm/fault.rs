@@ -11,9 +11,11 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
+    filesystem::vfs::IndexNode,
     ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
+        readahead::{force_page_cache_readahead, FileReadaheadState},
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -310,9 +312,41 @@ impl X86_64MMArch {
         };
 
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
-        let mut space_guard = current_address_space.write_irqsave();
+
+        // 用于在锁外进行预读的信息
+        // Option<(file, inode, page_cache, backing_pgoff)>
+        let mut prefetch_info: Option<(Arc<dyn IndexNode>, usize)> = None;
         let mut fault;
+        let mut retry_count = 0usize;
+
         loop {
+            // 如果需要预读，在获取锁之前进行
+            // 这样可以避免在持有地址空间锁时进行 Block I/O
+            if let Some((inode, pgoff)) = prefetch_info.take() {
+                // log::debug!(
+                //     "do_user_addr_fault: prefetching page, pgoff={}, retry_count={}, address={:#x}",
+                //     pgoff,
+                //     retry_count,
+                //     address.data()
+                // );
+                if let Some(page_cache) = inode.page_cache() {
+                    let mut ra_state = FileReadaheadState::new();
+                    // 使用 force_page_cache_readahead 强制读取指定页面
+                    // 而不是 page_cache_sync_readahead（按需预读算法可能判断为随机读而跳过）
+                    let result = force_page_cache_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
+                    log::debug!(
+                        "do_user_addr_fault: prefetch done, result={:?}, pgoff={}",
+                        result,
+                        pgoff
+                    );
+                } else {
+                    log::warn!("do_user_addr_fault: inode has no page_cache!");
+                }
+            }
+
+            // 获取地址空间写锁
+            let mut space_guard = current_address_space.write_irqsave();
+
             let vma = space_guard.mappings.find_nearest(address);
             let vma = match vma {
                 Some(vma) => vma,
@@ -425,6 +459,20 @@ impl X86_64MMArch {
                 send_segv();
                 return;
             }
+
+            // 在创建 PageFaultMessage 之前，提取文件映射信息用于可能的预读
+            // 这样当 VM_FAULT_RETRY 返回时，我们可以在释放锁后进行预读
+            let file_info = {
+                let guard = vma.lock_irqsave();
+                guard.vm_file().and_then(|file| {
+                    let inode = file.inode();
+                    let backing_pgoff = guard.backing_page_offset().map(|base| {
+                        base + ((address - guard.region().start()) >> MMArch::PAGE_SHIFT)
+                    });
+                    backing_pgoff.map(|pgoff| (inode, pgoff))
+                })
+            };
+
             let mapper = &mut space_guard.user_mapper.utable;
             let message = PageFaultMessage::new(vma.clone(), address, flags, mapper);
 
@@ -436,6 +484,22 @@ impl X86_64MMArch {
 
             if unlikely(fault.contains(VmFaultReason::VM_FAULT_RETRY)) {
                 flags |= FaultFlags::FAULT_FLAG_TRIED;
+                // 设置预读信息，在下一次循环开始时（锁释放后）进行预读
+                prefetch_info = file_info;
+                retry_count += 1;
+               
+                if retry_count > 10 {
+                    log::error!(
+                        "do_user_addr_fault: too many retries ({}), address={:#x}",
+                        retry_count,
+                        address.data()
+                    );
+                    send_segv();
+                    return;
+                }
+                // space_guard 在这里被 drop，释放锁
+                // 然后继续循环，在获取锁之前进行预读
+                continue;
             } else {
                 break;
             }

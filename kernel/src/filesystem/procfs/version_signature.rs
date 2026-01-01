@@ -11,7 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
 };
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
@@ -37,7 +37,7 @@ impl FileOps for VersionSignatureFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         proc_read(offset, len, buf, Self::VERSION_SIGNATURE)
     }

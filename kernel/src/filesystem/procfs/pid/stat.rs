@@ -11,7 +11,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    libs::spinlock::SpinLockGuard,
+    libs::{mutex::MutexGuard, spinlock::SpinLockGuard},
     mm::MemoryManagementArch,
     process::{pid::PidType, ProcessControlBlock, ProcessManager, ProcessState, RawPid},
 };
@@ -123,7 +123,7 @@ impl FileOps for StatFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let pcb = ProcessManager::find(self.pid).ok_or(SystemError::ESRCH)?;
 

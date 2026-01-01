@@ -19,6 +19,7 @@ use crate::{
     libs::{
         casting::DowncastArc,
         once::Once,
+        mutex::{Mutex, MutexGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::ProcessManager,
@@ -439,7 +440,7 @@ impl LockedDevFSInode {
         new_inode
             .downcast_ref::<LockedDevFSInode>()
             .unwrap()
-            .write_at(0, len, buf, SpinLock::new(FilePrivateData::Unused).lock())?;
+            .write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
         Ok(())
     }
 
@@ -516,13 +517,13 @@ impl IndexNode for LockedDevFSInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
     ) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -668,7 +669,7 @@ impl IndexNode for LockedDevFSInode {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let meta = self.metadata()?;
         match meta.file_type {
@@ -710,7 +711,7 @@ impl IndexNode for LockedDevFSInode {
         offset: usize,
         len: usize,
         buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let meta = self.metadata()?;
         match meta.file_type {

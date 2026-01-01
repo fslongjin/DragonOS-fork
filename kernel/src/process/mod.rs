@@ -849,6 +849,9 @@ bitflags! {
         const FORKNOEXEC = 1 << 11;
         /// 进程需要在返回用户态前处理 rseq
         const NEED_RSEQ = 1 << 12;
+
+        /// 标记为 IO worker（内核线程）：用于在 CFS wakeup 时做定向 placement/boost
+        const IO_WORKER = 1 << 13;
     }
 }
 

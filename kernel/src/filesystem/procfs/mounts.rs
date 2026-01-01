@@ -138,7 +138,7 @@ impl FileOps for MountsFileOps {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        _data: crate::libs::spinlock::SpinLockGuard<FilePrivateData>,
+        _data: crate::libs::mutex::MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let mounts_content = generate_mounts_like_content(MountsFormat::Mounts);
         let bytes = mounts_content.as_bytes();

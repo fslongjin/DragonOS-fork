@@ -6,7 +6,7 @@ use crate::filesystem::vfs::{
     file::{File, FileFlags, FileMode},
     FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, Metadata,
 };
-use crate::libs::spinlock::SpinLockGuard;
+use crate::libs::mutex::MutexGuard;
 use crate::process::ProcessManager;
 use crate::{arch::KVMArch, libs::spinlock::SpinLock, time::PosixTimeSpec};
 // use crate::virt::kvm::{host_stack};
@@ -93,14 +93,14 @@ impl IndexNode for LockedKvmInode {
 
     fn open(
         &self,
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
         _mode: &FileMode,
     ) -> Result<(), SystemError> {
         debug!("file private data:{:?}", _data);
         return Ok(());
     }
 
-    fn close(&self, _data: SpinLockGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
@@ -165,7 +165,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -176,7 +176,7 @@ impl IndexNode for LockedKvmInode {
         _offset: usize,
         _len: usize,
         _buf: &[u8],
-        _data: SpinLockGuard<FilePrivateData>,
+        _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         Err(SystemError::ENOSYS)
     }

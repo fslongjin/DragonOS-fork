@@ -20,7 +20,9 @@ use crate::{
     filesystem::{page_cache::PageCache, vfs::FilePrivateData},
     init::initcall::INITCALL_CORE,
     libs::{
+        mutex::{Mutex, MutexGuard},
         rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
     process::{ProcessControlBlock, ProcessManager},
@@ -81,14 +83,14 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return Some(p);
         }
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        if let Some(p) = page_reclaimer_lock_irqsave().get(paddr) {
+        if let Some(p) = page_reclaimer_lock().get(paddr) {
             return p;
         }
         self.phys2page
@@ -214,11 +216,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<SpinLock<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<Mutex<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = SpinLock::new(PageReclaimer::new());
+    let page_reclaimer = Mutex::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
@@ -263,7 +265,7 @@ fn page_reclaim_thread() -> i32 {
             PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            page_reclaimer_lock_irqsave().flush_dirty_pages();
+            page_reclaimer_lock().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
             let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
@@ -272,8 +274,8 @@ fn page_reclaim_thread() -> i32 {
 }
 
 /// 获取页面回收器
-pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
+    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
 }
 
 /// 页面回收器
@@ -307,7 +309,7 @@ impl PageReclaimer {
     pub fn shrink_list(count: PageFrameCount) {
         // 阶段1：仅持有回收器锁，摘取受害者
         let victims = {
-            let mut reclaimer = page_reclaimer_lock_irqsave();
+            let mut reclaimer = page_reclaimer_lock();
             reclaimer.drain_lru(count)
         };
 
@@ -337,7 +339,7 @@ impl PageReclaimer {
                 // still-mapped page will trip InnerPage::drop assertions and can crash userland.
                 if guard.map_count() != 0 {
                     drop(guard);
-                    page_reclaimer_lock_irqsave().insert_page(page.phys_address(), &page);
+                    page_reclaimer_lock().insert_page(page.phys_address(), &page);
                     continue;
                 }
 
@@ -354,7 +356,7 @@ impl PageReclaimer {
                 // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
                 // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
                 if let Some(page_cache) = info.page_cache.upgrade() {
-                    page_cache.lock_irqsave().remove_page(page_index);
+                    page_cache.lock().remove_page(page_index);
                 }
                 page_manager_lock_irqsave().remove_page(&paddr);
             }
@@ -375,7 +377,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut RwLockWriteGuard<InnerPage>, unmap: bool) {
+    pub fn page_writeback(guard: &mut RwSemWriteGuard<'_, InnerPage>, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -392,33 +394,39 @@ impl PageReclaimer {
             }
         };
         let paddr = guard.phys_address();
-        let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
 
+        // 第一步：处理页表映射（需要持有地址空间锁）
         for vma in guard.vma_set() {
             let address_space = vma.lock_irqsave().address_space().and_then(|x| x.upgrade());
             if address_space.is_none() {
                 continue;
             }
             let address_space = address_space.unwrap();
-            let mut guard = address_space.write();
-            let mapper = &mut guard.user_mapper.utable;
-            let virt = vma.lock_irqsave().page_address(page_index).unwrap();
-            if unmap {
-                unsafe {
-                    // 取消页表映射
-                    mapper.unmap(virt, false).unwrap().flush();
+            // 注意：这里使用 write_irqsave() 获取 RwLock 写锁
+            // 在下面的大括号结束后锁会自动释放
+            {
+                let mut space_guard = address_space.write_irqsave();
+                let mapper = &mut space_guard.user_mapper.utable;
+                let virt = vma.lock_irqsave().page_address(page_index).unwrap();
+                if unmap {
+                    unsafe {
+                        // 取消页表映射
+                        mapper.unmap(virt, false).unwrap().flush();
+                    }
+                } else {
+                    unsafe {
+                        // 保护位设为只读
+                        mapper.remap(
+                            virt,
+                            mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
+                        )
+                    };
                 }
-            } else {
-                unsafe {
-                    // 保护位设为只读
-                    mapper.remap(
-                        virt,
-                        mapper.get_entry(virt, 0).unwrap().flags().set_write(false),
-                    )
-                };
-            }
+            } // space_guard 在这里被 drop，释放地址空间锁
         }
 
+        // 第二步：执行磁盘写回（此时不持有地址空间锁）
+        let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let len = if let Ok(metadata) = inode.metadata() {
             let size = metadata.size as usize;
             size.saturating_sub(page_index * MMArch::PAGE_SIZE)
@@ -437,7 +445,7 @@ impl PageReclaimer {
                             len,
                         )
                     },
-                    SpinLock::new(FilePrivateData::Unused).lock(),
+                    Mutex::new(FilePrivateData::Unused).lock(),
                 )
                 .unwrap();
         }
@@ -484,7 +492,7 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct Page {
-    inner: RwLock<InnerPage>,
+    inner: RwSem<InnerPage>,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
 }
@@ -505,11 +513,11 @@ impl Page {
     fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
         let inner = InnerPage::new(phys_addr, page_type, flags);
         let page = Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr,
         });
         if page.read_irqsave().flags == PageFlags::PG_LRU {
-            page_reclaimer_lock_irqsave().insert_page(phys_addr, &page);
+            page_reclaimer_lock().insert_page(phys_addr, &page);
         };
         page
     }
@@ -526,7 +534,7 @@ impl Page {
     /// - `Ok(Arc<Page>)`: 新页面
     /// - `Err(SystemError)`: 错误码
     fn copy(
-        old_guard: RwLockReadGuard<InnerPage>,
+        old_guard: RwSemReadGuard<'_, InnerPage>,
         new_phys: PhysAddr,
     ) -> Result<Arc<Page>, SystemError> {
         let page_type = old_guard.page_type().clone();
@@ -540,7 +548,7 @@ impl Page {
                 .copy_from_nonoverlapping(old_vaddr.data() as *mut u8, MMArch::PAGE_SIZE);
         }
         Ok(Arc::new(Self {
-            inner: RwLock::new(inner),
+            inner: RwSem::new(inner),
             phys_addr: new_phys,
         }))
     }
@@ -550,12 +558,12 @@ impl Page {
         self.phys_addr
     }
 
-    pub fn read_irqsave(&self) -> RwLockReadGuard<'_, InnerPage> {
-        self.inner.read_irqsave()
+    pub fn read_irqsave(&self) -> RwSemReadGuard<'_, InnerPage> {
+        self.inner.read()
     }
 
-    pub fn write_irqsave(&self) -> RwLockWriteGuard<'_, InnerPage> {
-        self.inner.write_irqsave()
+    pub fn write_irqsave(&self) -> RwSemWriteGuard<'_, InnerPage> {
+        self.inner.write()
     }
 }
 

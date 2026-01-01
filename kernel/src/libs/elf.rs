@@ -125,20 +125,22 @@ impl ElfLoader {
     ///
     /// ## 参数
     ///
-    /// - `user_vm_guard` - 用户虚拟地址空间
+    /// - `param` - 执行参数
     /// - `start` - 本次映射的起始地址
     /// - `end` - 本次映射的结束地址（不包含）
     /// - `prot_flags` - 本次映射的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
+        param: &ExecParam,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
     ) -> Result<(), ExecError> {
         let start = Self::elf_page_start(start);
         let end = Self::elf_page_align_up(end);
+        let vm = param.vm().clone();
         // debug!("set_elf_brk: start={:?}, end={:?}", start, end);
+        let mut user_vm_guard = vm.write();
         if end > start {
             let r = user_vm_guard.map_anonymous(
                 start,
@@ -200,7 +202,6 @@ impl ElfLoader {
     /// https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#365
     /// ## 参数
     ///
-    /// - `user_vm_guard`：用户空间地址空间
     /// - `param`：执行参数
     /// - `phent`：ELF文件的ProgramHeader
     /// - `addr_to_map`：当前段应该被加载到的内存地址
@@ -213,7 +214,6 @@ impl ElfLoader {
     /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
     #[allow(clippy::too_many_arguments)]
     fn load_elf_segment(
-        user_vm_guard: &mut RwLockWriteGuard<'_, InnerAddressSpace>,
         param: &mut ExecParam,
         phent: &ProgramHeader,
         mut addr_to_map: VirtAddr,
@@ -262,6 +262,7 @@ impl ElfLoader {
 
         // 映射到的虚拟地址。请注意，这个虚拟地址是user_vm_guard这个地址空间的虚拟地址。不一定是当前进程地址空间的
         let map_addr: VirtAddr;
+        let vm = param.vm().clone();
 
         // total_size is the size of the ELF (interpreter) image.
         // The _first_ mmap needs to know the full size, otherwise
@@ -274,7 +275,8 @@ impl ElfLoader {
 
             // log::debug!("total_size={}", total_size);
 
-            map_addr = user_vm_guard
+            map_addr = vm
+                .write()
                 .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false, true)
                 .map_err(map_err_handler)?
                 .virt_address();
@@ -282,7 +284,7 @@ impl ElfLoader {
             let to_unmap = map_addr + map_size;
             let to_unmap_size = total_size - map_size;
 
-            user_vm_guard.munmap(
+            vm.write().munmap(
                 VirtPageFrame::new(to_unmap),
                 PageFrameCount::from_bytes(to_unmap_size).unwrap(),
             )?;
@@ -295,7 +297,7 @@ impl ElfLoader {
                 param,
             )?;
             if tmp_prot != *prot {
-                user_vm_guard.mprotect(
+                vm.write().mprotect(
                     VirtPageFrame::new(map_addr),
                     PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
                     *prot,
@@ -304,7 +306,8 @@ impl ElfLoader {
         } else {
             // debug!("total size = 0");
 
-            map_addr = user_vm_guard
+            map_addr = vm
+                .write()
                 .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
                 .virt_address();
             // debug!(
@@ -321,7 +324,7 @@ impl ElfLoader {
             )?;
 
             if tmp_prot != *prot {
-                user_vm_guard.mprotect(
+                vm.write().mprotect(
                     VirtPageFrame::new(map_addr),
                     PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
                     *prot,
@@ -393,7 +396,6 @@ impl ElfLoader {
                     addr_to_map = VirtAddr::new(0);
                 }
                 let map_addr = Self::load_elf_segment(
-                    &mut interp_elf_ex.vm().clone().write(),
                     interp_elf_ex,
                     &section,
                     addr_to_map,
@@ -746,7 +748,7 @@ impl BinaryLoader for ElfLoader {
         // debug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
-        let mut user_vm = binding.write();
+        // let mut user_vm = binding.write();
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
@@ -861,7 +863,7 @@ impl BinaryLoader for ElfLoader {
                 //     elf_bss
                 // );
                 self.set_elf_brk(
-                    &mut user_vm,
+                    param,
                     elf_bss + load_bias,
                     elf_brk + load_bias,
                     bss_prot_flags,
@@ -920,7 +922,6 @@ impl BinaryLoader for ElfLoader {
 
             // log::debug!("bias: {load_bias}");
             let e = Self::load_elf_segment(
-                &mut user_vm,
                 param,
                 &seg_to_load,
                 vaddr + load_bias,
@@ -1034,13 +1035,13 @@ impl BinaryLoader for ElfLoader {
         //     elf_brk,
         //     bss_prot_flags
         // );
-        self.set_elf_brk(&mut user_vm, elf_bss, elf_brk, bss_prot_flags)?;
+        self.set_elf_brk(param, elf_bss, elf_brk, bss_prot_flags)?;
 
         if likely(elf_bss != elf_brk) && unlikely(Self::pad_zero(elf_bss).is_err()) {
             // debug!("elf_bss = {elf_bss:?}, elf_brk = {elf_brk:?}");
             return Err(ExecError::BadAddress(Some(elf_bss)));
         }
-        drop(user_vm);
+        // drop(user_vm);
         if let Some(mut interpreter) = interpreter {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
             let elf_entry = Self::load_elf_interp(&mut interpreter, load_bias)?.entry_point();
