@@ -11,7 +11,7 @@ use alloc::{
     vec::Vec,
 };
 use bitmap::{static_bitmap, traits::BitMapOps};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
@@ -62,6 +62,7 @@ use crate::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessFlags,
     },
+    time::Duration,
 };
 
 const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
@@ -175,7 +176,7 @@ pub struct VirtIOBlkDevice {
     /// virtio-drivers 的 non-blocking API 本身不阻塞；设备对象由 worker 与 IRQ 共享。
     blk: Mutex<VirtIOBlk<HalImpl, VirtIOTransport>>,
     submit_wq: WaitQueue,
-    has_work: AtomicBool,
+    work_seq: AtomicU64,
     pending: Mutex<VecDeque<Arc<crate::driver::block::bio::Bio>>>,
     inflight: Mutex<HashMap<u16, Inflight>>,
     locked_kobj_state: LockedKObjectState,
@@ -245,6 +246,13 @@ struct Inflight {
     dma: DmaBounce,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmitState {
+    Idle,
+    Submitted,
+    QueueFull,
+}
+
 impl VirtIOBlkDevice {
     pub fn new(transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
         // 设置中断
@@ -278,7 +286,7 @@ impl VirtIOBlkDevice {
             }),
             blk: Mutex::new(blk),
             submit_wq: WaitQueue::default(),
-            has_work: AtomicBool::new(false),
+            work_seq: AtomicU64::new(0),
             pending: Mutex::new(VecDeque::new()),
             inflight: Mutex::new(HashMap::new()),
             parent: RwSem::new(Weak::default()),
@@ -320,46 +328,61 @@ impl VirtIOBlkDevice {
 
     pub fn submit_bio(&self, bio: Arc<crate::driver::block::bio::Bio>) {
         self.pending.lock().push_back(bio);
-        self.has_work.store(true, Ordering::Release);
         self.submit_wq.wakeup(None);
     }
 
     fn worker_loop(&self) -> ! {
+        let mut observed = self.work_seq.load(Ordering::Acquire);
         loop {
-            // NOTE: Avoid lost-wakeup races.
-            // Producers (submit_bio / IRQ) do:
-            //   pending.push; has_work=true; wakeup(worker)
-            // If the worker clears has_work with store(false) after an IRQ sets it true,
-            // the wake can be lost and the worker may sleep forever even though completions exist.
-            //
-            // Protocol:
-            // - Worker *consumes* the flag via swap(false)
-            // - Worker only sleeps when there is no visible work AND flag is false
-            // - Any concurrent producer setting has_work=true will be observed on next iteration
+            self.process_completions();
+            let submit_state = self.process_submissions();
 
-            // Fast-path: if there is any visible work, do not sleep.
-            let has_pending = !self.pending.lock().is_empty();
-            let has_inflight = !self.inflight.lock().is_empty();
             let has_used = {
                 let mut blk = self.blk.lock();
                 blk.peek_used().is_some()
             };
-
-            if !has_pending && !has_inflight && !has_used {
-                // Consume any already-signaled work; otherwise sleep until signaled.
-                if !self.has_work.swap(false, Ordering::AcqRel) {
-                    let _ = self.submit_wq.wait_event_interruptible_timeout(
-                        || self.has_work.swap(false, Ordering::AcqRel),
-                        None,
-                    );
-                }
-            } else {
-                // Keep the loop running without sleeping.
-                let _ = self.has_work.swap(false, Ordering::AcqRel);
+            if has_used {
+                observed = self.work_seq.load(Ordering::Acquire);
+                continue;
             }
 
-            self.process_completions();
-            self.process_submissions();
+            let pending_empty = self.pending.lock().is_empty();
+            let inflight_empty = self.inflight.lock().is_empty();
+
+            if submit_state == SubmitState::QueueFull {
+                let _ = self.submit_wq.wait_event_interruptible_timeout(
+                    || {
+                        if self.work_seq.load(Ordering::Acquire) != observed {
+                            return true;
+                        }
+                        let mut blk = self.blk.lock();
+                        blk.peek_used().is_some()
+                    },
+                    Some(Duration::from_millis(100)),
+                );
+            } else if pending_empty && !has_used {
+                let timeout = if inflight_empty {
+                    None
+                } else {
+                    Some(Duration::from_millis(100))
+                };
+
+                let _ = self.submit_wq.wait_event_interruptible_timeout(
+                    || {
+                        if self.work_seq.load(Ordering::Acquire) != observed {
+                            return true;
+                        }
+                        if !self.pending.lock().is_empty() {
+                            return true;
+                        }
+                        let mut blk = self.blk.lock();
+                        blk.peek_used().is_some()
+                    },
+                    timeout,
+                );
+            }
+
+            observed = self.work_seq.load(Ordering::Acquire);
         }
     }
 
@@ -433,7 +456,8 @@ impl VirtIOBlkDevice {
         }
     }
 
-    fn process_submissions(&self) {
+    fn process_submissions(&self) -> SubmitState {
+        let mut submitted_any = false;
         loop {
             let bio = match self.pending.lock().pop_front() {
                 Some(b) => b,
@@ -498,14 +522,20 @@ impl VirtIOBlkDevice {
                             dma,
                         },
                     );
+                    submitted_any = true;
                 }
                 Err(virtio_drivers::Error::QueueFull) => {
                     // 队列满：放回 pending，等待 IRQ/完成后重试
                     self.pending.lock().push_front(bio);
-                    break;
+                    return SubmitState::QueueFull;
                 }
                 Err(_) => bio.complete(Err(SystemError::EIO)),
             }
+        }
+        if submitted_any {
+            SubmitState::Submitted
+        } else {
+            SubmitState::Idle
         }
     }
 
@@ -711,7 +741,7 @@ impl VirtIODevice for VirtIOBlkDevice {
     ) -> Result<IrqReturn, system_error::SystemError> {
         // 中断处理：唤醒 worker 线程处理完成的 I/O
         // worker 会在进程上下文中处理 ack_interrupt 和 completion
-        self.has_work.store(true, Ordering::Release);
+        self.work_seq.fetch_add(1, Ordering::Release);
         self.submit_wq.wakeup(None);
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }

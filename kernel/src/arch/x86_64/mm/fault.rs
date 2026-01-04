@@ -334,11 +334,11 @@ impl X86_64MMArch {
                     // 使用 force_page_cache_readahead 强制读取指定页面
                     // 而不是 page_cache_sync_readahead（按需预读算法可能判断为随机读而跳过）
                     let result = force_page_cache_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
-                    log::debug!(
-                        "do_user_addr_fault: prefetch done, result={:?}, pgoff={}",
-                        result,
-                        pgoff
-                    );
+                    // log::debug!(
+                    //     "do_user_addr_fault: prefetch done, result={:?}, pgoff={}",
+                    //     result,
+                    //     pgoff
+                    // );
                 } else {
                     log::warn!("do_user_addr_fault: inode has no page_cache!");
                 }
