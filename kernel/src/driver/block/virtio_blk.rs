@@ -321,6 +321,16 @@ impl VirtIOBlkDevice {
         // Mark it so CFS can apply a wakeup-placement boost.
         if let Some(pcb) = worker_pcb.as_ref() {
             pcb.flags().insert(ProcessFlags::IO_WORKER);
+            if let Err(e) = crate::process::ProcessManager::set_fifo_policy(
+                pcb,
+                crate::sched::prio::MAX_RT_PRIO - 50,
+            ) {
+                error!(
+                    "virtio_blk_{}_io set FIFO policy failed: {:?}",
+                    dev.blkdev_meta.devname.to_string(),
+                    e
+                );
+            }
         }
 
         Some(dev)
