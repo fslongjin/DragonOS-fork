@@ -11,11 +11,13 @@ use crate::{
         CurrentIrqArch, MMArch,
     },
     exception::{extable::ExceptionTableManager, InterruptArch},
-    filesystem::vfs::IndexNode,
+    filesystem::vfs::{file::File, IndexNode},
     ipc::signal_types::{SigCode, SigInfo, SigType},
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
-        readahead::{force_page_cache_readahead, FileReadaheadState},
+        readahead::{
+            force_page_cache_readahead, page_cache_sync_readahead,
+        },
         ucontext::{AddressSpace, LockedVMA},
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -314,31 +316,41 @@ impl X86_64MMArch {
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
         // 用于在锁外进行预读的信息
-        // Option<(file, inode, page_cache, backing_pgoff)>
-        let mut prefetch_info: Option<(Arc<dyn IndexNode>, usize)> = None;
+        // Option<(file, pgoff)>
+        let mut prefetch_info: Option<(Arc<File>, usize)> = None;
         let mut fault;
         let mut retry_count = 0usize;
 
         loop {
             // 如果需要预读，在获取锁之前进行
             // 这样可以避免在持有地址空间锁时进行 Block I/O
-            if let Some((inode, pgoff)) = prefetch_info.take() {
-                // log::debug!(
-                //     "do_user_addr_fault: prefetching page, pgoff={}, retry_count={}, address={:#x}",
-                //     pgoff,
-                //     retry_count,
-                //     address.data()
-                // );
+            if let Some((file, pgoff)) = prefetch_info.take() {
+                let inode = file.inode();
                 if let Some(page_cache) = inode.page_cache() {
-                    let mut ra_state = FileReadaheadState::new();
-                    // 使用 force_page_cache_readahead 强制读取指定页面
-                    // 而不是 page_cache_sync_readahead（按需预读算法可能判断为随机读而跳过）
-                    let result = force_page_cache_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
-                    // log::debug!(
-                    //     "do_user_addr_fault: prefetch done, result={:?}, pgoff={}",
-                    //     result,
-                    //     pgoff
-                    // );
+                    // 获取文件的预读状态，而不是每次创建一个新的
+                    let mut ra_state = file.get_ra_state();
+
+                    // 使用 page_cache_sync_readahead 进行自适应预读
+                    // 它会根据访问模式自动决定预读的大小
+                    let result =
+                        page_cache_sync_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
+                    let r =result.unwrap_or(0);
+                    if r == 0 {
+                        // 如果 sync_readahead 返回 0 (例如随机读)，它可能没有进行任何读取。
+                        // 但我们必须确保 faulting page 被读取，所以这里强制读取 1 页。
+                        // 注意：force_page_cache_readahead 不会更新 ra_state 的 sequential 统计，这对于随机读是正确的。
+                        log::debug!("force_page_cache_readahead: pgoff: {}",pgoff);
+                        let _ =
+                            force_page_cache_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
+                    }else{
+                        log::debug!("prefetched {r} pages");
+                    }
+
+                    // 更新 prev_index，以便下一次能正确判断顺序读
+                    ra_state.prev_index = pgoff as i64;
+
+                    // 更新回文件
+                    let _ = file.set_ra_state(ra_state);
                 } else {
                     log::warn!("do_user_addr_fault: inode has no page_cache!");
                 }
@@ -465,11 +477,10 @@ impl X86_64MMArch {
             let file_info = {
                 let guard = vma.lock_irqsave();
                 guard.vm_file().and_then(|file| {
-                    let inode = file.inode();
                     let backing_pgoff = guard.backing_page_offset().map(|base| {
                         base + ((address - guard.region().start()) >> MMArch::PAGE_SHIFT)
                     });
-                    backing_pgoff.map(|pgoff| (inode, pgoff))
+                    backing_pgoff.map(|pgoff| (file, pgoff))
                 })
             };
 
