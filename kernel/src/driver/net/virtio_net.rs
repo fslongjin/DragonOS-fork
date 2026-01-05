@@ -6,6 +6,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -43,7 +44,7 @@ use crate::{
             VIRTIO_VENDOR_ID,
         },
     },
-    exception::{irqdesc::IrqReturn, IrqNumber},
+    exception::{irqdesc::IrqReturn, tasklet::{Tasklet, tasklet_schedule}, IrqNumber},
     filesystem::{kernfs::KernFSInode, sysfs::AttributeGroup},
     init::initcall::INITCALL_POSTCORE,
     libs::{
@@ -77,6 +78,8 @@ pub struct VirtIONetDevice {
 
     // 指向对应的interface
     iface_ref: RwLock<Weak<VirtioInterface>>,
+    tasklet: Arc<Tasklet>,
+    tasklet_data: usize,
 }
 
 impl Debug for VirtIONetDevice {
@@ -124,17 +127,24 @@ impl VirtIONetDevice {
         debug!("VirtIONetDevice mac: {:?}", mac);
         let device_inner = VirtIONicDeviceInner::new(driver_net);
         device_inner.inner.lock_irqsave().enable_interrupts();
-        let dev = Arc::new(Self {
-            dev_id,
-            inner: SpinLock::new(InnerVirtIONetDevice {
-                device_inner,
-                name: None,
-                virtio_index: None,
-                kobj_common: KObjectCommonData::default(),
-                device_common: DeviceCommonData::default(),
-            }),
-            locked_kobj_state: LockedKObjectState::default(),
-            iface_ref: RwLock::new(Weak::new()),
+        
+        let dev = Arc::new_cyclic(|self_ref| {
+            let weak_ptr = Box::into_raw(Box::new(self_ref.clone())) as usize;
+            let tasklet = Tasklet::new(Self::irq_tasklet_handler, weak_ptr);
+            Self {
+                dev_id,
+                inner: SpinLock::new(InnerVirtIONetDevice {
+                    device_inner,
+                    name: None,
+                    virtio_index: None,
+                    kobj_common: KObjectCommonData::default(),
+                    device_common: DeviceCommonData::default(),
+                }),
+                locked_kobj_state: LockedKObjectState::default(),
+                iface_ref: RwLock::new(Weak::new()),
+                tasklet,
+                tasklet_data: weak_ptr,
+            }
         });
 
         // dev.set_driver(Some(Arc::downgrade(&virtio_net_driver()) as Weak<dyn Driver>));
@@ -285,24 +295,41 @@ impl Device for VirtIONetDevice {
     }
 }
 
-impl VirtIODevice for VirtIONetDevice {
-    fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
-        let Some(iface) = self.iface() else {
+impl VirtIONetDevice {
+    fn irq_tasklet_handler(data: usize) {
+        let weak_ref = unsafe { &*(data as *const Weak<Self>) };
+        let Some(dev) = weak_ref.upgrade() else {
+            return;
+        };
+
+        let Some(iface) = dev.iface() else {
             error!(
                 "VirtIONetDevice '{:?}' has no associated iface to handle irq",
-                self.dev_id.id()
+                dev.dev_id.id()
             );
-            return Ok(IrqReturn::NotHandled);
+            return;
         };
 
         let Some(napi) = iface.napi_struct() else {
             log::error!("Virtio net device {} has no napi_struct", iface.name());
-            return Ok(IrqReturn::NotHandled);
+            return;
         };
 
         napi_schedule(napi);
+    }
+}
 
-        // self.netns.wakeup_poll_thread();
+impl Drop for VirtIONetDevice {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(self.tasklet_data as *mut Weak<Self>);
+        }
+    }
+}
+
+impl VirtIODevice for VirtIONetDevice {
+    fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
+        tasklet_schedule(&self.tasklet);
         return Ok(IrqReturn::Handled);
     }
 

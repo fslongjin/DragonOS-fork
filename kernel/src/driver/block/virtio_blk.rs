@@ -25,44 +25,30 @@ use crate::{
             block::{
                 block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
                 disk_info::Partition,
-                manager::{block_dev_manager, BlockDevMeta},
+                manager::{BlockDevMeta, block_dev_manager},
             },
             class::Class,
             device::{
-                bus::Bus,
-                device_number::Major,
-                driver::{Driver, DriverCommonData},
-                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable,
+                DevName, Device, DeviceCommonData, DeviceId, DeviceType, IdTable, bus::Bus, device_number::Major, driver::{Driver, DriverCommonData}
             },
             kobject::{KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState},
             kset::KSet,
         },
         virtio::{
-            sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
-            transport::VirtIOTransport,
-            virtio_impl::HalImpl,
-            VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
-            VIRTIO_VENDOR_ID,
+            VIRTIO_VENDOR_ID, VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId, sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager}, transport::VirtIOTransport, virtio_impl::HalImpl
         },
-    },
-    exception::{irqdesc::IrqReturn, IrqNumber},
-    filesystem::{
+    }, exception::{IrqNumber, irqdesc::IrqReturn, tasklet::{Tasklet, tasklet_schedule}}, filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
         kernfs::KernFSInode,
         mbr::MbrDiskPartionTable,
-        vfs::{utils::DName, IndexNode, InodeMode, Metadata},
-    },
-    init::initcall::INITCALL_POSTCORE,
-    libs::{
+        vfs::{IndexNode, InodeMode, Metadata, utils::DName},
+    }, init::initcall::INITCALL_POSTCORE, libs::{
         mutex::{Mutex, MutexGuard},
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         wait_queue::WaitQueue,
-    },
-    process::{
-        kthread::{KernelThreadClosure, KernelThreadMechanism},
-        ProcessFlags,
-    },
-    time::Duration,
+    }, process::{
+        ProcessFlags, kthread::{KernelThreadClosure, KernelThreadMechanism}
+    }, sched::sched_yield, time::Duration
 };
 
 const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
@@ -184,6 +170,8 @@ pub struct VirtIOBlkDevice {
     parent: RwSem<Weak<LockedDevFSInode>>,
     fs: RwSem<Weak<DevFS>>,
     metadata: Metadata,
+    tasklet: Arc<Tasklet>,
+    tasklet_data: usize,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -272,29 +260,36 @@ impl VirtIOBlkDevice {
         let mut blk: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
         blk.enable_interrupts();
 
-        let dev = Arc::new_cyclic(|self_ref| Self {
-            blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
-            self_ref: self_ref.clone(),
-            dev_id,
-            locked_kobj_state: LockedKObjectState::default(),
-            inner: Mutex::new(InnerVirtIOBlkDevice {
-                name: None,
-                virtio_index: None,
-                device_common: DeviceCommonData::default(),
-                kobject_common: KObjectCommonData::default(),
-                irq,
-            }),
-            blk: Mutex::new(blk),
-            submit_wq: WaitQueue::default(),
-            work_seq: AtomicU64::new(0),
-            pending: Mutex::new(VecDeque::new()),
-            inflight: Mutex::new(HashMap::new()),
-            parent: RwSem::new(Weak::default()),
-            fs: RwSem::new(Weak::default()),
-            metadata: Metadata::new(
-                crate::filesystem::vfs::FileType::BlockDevice,
-                InodeMode::from_bits_truncate(0o755),
-            ),
+        let dev = Arc::new_cyclic(|self_ref| {
+            let weak_ptr = Box::into_raw(Box::new(self_ref.clone())) as usize;
+            let tasklet = Tasklet::new(Self::irq_tasklet_handler, weak_ptr);
+
+            Self {
+                blkdev_meta: BlockDevMeta::new(devname, Major::VIRTIO_BLK_MAJOR),
+                self_ref: self_ref.clone(),
+                dev_id,
+                locked_kobj_state: LockedKObjectState::default(),
+                inner: Mutex::new(InnerVirtIOBlkDevice {
+                    name: None,
+                    virtio_index: None,
+                    device_common: DeviceCommonData::default(),
+                    kobject_common: KObjectCommonData::default(),
+                    irq,
+                }),
+                blk: Mutex::new(blk),
+                submit_wq: WaitQueue::default(),
+                work_seq: AtomicU64::new(0),
+                pending: Mutex::new(VecDeque::new()),
+                inflight: Mutex::new(HashMap::new()),
+                parent: RwSem::new(Weak::default()),
+                fs: RwSem::new(Weak::default()),
+                metadata: Metadata::new(
+                    crate::filesystem::vfs::FileType::BlockDevice,
+                    InodeMode::from_bits_truncate(0o755),
+                ),
+                tasklet,
+                tasklet_data: weak_ptr,
+            }
         });
 
         // 启动 per-device worker（负责 submit + completion）
@@ -339,6 +334,7 @@ impl VirtIOBlkDevice {
     pub fn submit_bio(&self, bio: Arc<crate::driver::block::bio::Bio>) {
         self.pending.lock().push_back(bio);
         self.submit_wq.wakeup(None);
+        sched_yield();
     }
 
     fn worker_loop(&self) -> ! {
@@ -552,6 +548,21 @@ impl VirtIOBlkDevice {
     fn inner(&self) -> MutexGuard<'_, InnerVirtIOBlkDevice> {
         self.inner.lock()
     }
+
+    fn irq_tasklet_handler(data: usize) {
+        let weak_ref = unsafe { &*(data as *const Weak<Self>) };
+        if let Some(dev) = weak_ref.upgrade() {
+            dev.submit_wq.wakeup(None);
+        }
+    }
+}
+
+impl Drop for VirtIOBlkDevice {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(self.tasklet_data as *mut Weak<Self>);
+        }
+    }
 }
 
 impl IndexNode for VirtIOBlkDevice {
@@ -752,7 +763,7 @@ impl VirtIODevice for VirtIOBlkDevice {
         // 中断处理：唤醒 worker 线程处理完成的 I/O
         // worker 会在进程上下文中处理 ack_interrupt 和 completion
         self.work_seq.fetch_add(1, Ordering::Release);
-        self.submit_wq.wakeup(None);
+        tasklet_schedule(&self.tasklet);
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
     }
 

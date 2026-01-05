@@ -337,12 +337,19 @@ impl X86_64MMArch {
                     let r =result.unwrap_or(0);
                     if r == 0 {
                         // 如果 sync_readahead 返回 0 (例如随机读)，它可能没有进行任何读取。
-                        // 但我们必须确保 faulting page 被读取，所以这里强制读取 1 页。
-                        // 注意：force_page_cache_readahead 不会更新 ra_state 的 sequential 统计，这对于随机读是正确的。
-                        log::debug!("force_page_cache_readahead: pgoff: {}",pgoff);
-                        let _ =
-                            force_page_cache_readahead(&page_cache, &inode, &mut ra_state, pgoff, 1);
-                    }else{
+                        // 但我们必须确保 faulting page 被读取，所以这里强制预读。
+                        // 即使是随机访问，也预读多页以利用空间局部性，减少IO请求次数。
+                        const MIN_READAHEAD_PAGES: usize = 16;
+                        log::debug!("force_page_cache_readahead: pgoff: {}", pgoff);
+                        let r = force_page_cache_readahead(
+                            &page_cache,
+                            &inode,
+                            &mut ra_state,
+                            pgoff,
+                            MIN_READAHEAD_PAGES,
+                        );
+                        log::debug!("prefetched {} pages", r.unwrap_or(0));
+                    } else {
                         log::debug!("prefetched {r} pages");
                     }
 

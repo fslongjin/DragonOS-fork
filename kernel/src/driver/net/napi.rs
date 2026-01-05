@@ -187,6 +187,7 @@ pub fn napi_schedule(napi: Arc<NapiStruct>) {
     let mut inner = GLOBAL_NAPI_MANAGER.inner();
     inner.napi_list.push(napi);
     inner.has_pending_signal.store(true, Ordering::SeqCst);
+    drop(inner);
 
     GLOBAL_NAPI_MANAGER.wakeup();
 

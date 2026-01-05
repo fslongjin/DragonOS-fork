@@ -17,12 +17,11 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch},
+    arch::{CurrentIrqArch, ipc::signal::Signal},
     exception::InterruptArch,
     process::{ProcessControlBlock, ProcessManager, ProcessState},
-    sched::{schedule, SchedMode},
-    time::timer::{next_n_us_timer_jiffies, Timer},
-    time::{Duration, Instant},
+    sched::{SchedMode, sched_yield, schedule},
+    time::{Duration, Instant, timer::{Timer, next_n_us_timer_jiffies}},
 };
 
 use super::{
@@ -409,6 +408,9 @@ impl Waker {
         }
         if let Some(pcb) = self.target.upgrade() {
             let _ = ProcessManager::wakeup(&pcb);
+            if ProcessManager::current_pcb().preempt_count() == 0 {
+                sched_yield();
+            }
         }
         true
     }

@@ -24,10 +24,9 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    arch::{interrupt::ipi::send_ipi, CurrentIrqArch},
+    arch::{CurrentIrqArch, cpu::current_cpu_id, interrupt::ipi::send_ipi},
     exception::{
-        ipi::{IpiKind, IpiTarget},
-        InterruptArch,
+        InterruptArch, ipi::{IpiKind, IpiTarget}
     },
     libs::{
         lazy_init::Lazy,
@@ -1019,4 +1018,32 @@ pub fn sched_init() {
 #[inline]
 pub fn send_resched_ipi(cpu: ProcessorId) {
     send_ipi(IpiKind::KickCpu, IpiTarget::Specified(cpu));
+}
+
+
+pub fn sched_yield() {
+    // 禁用中断
+    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+    let pcb = ProcessManager::current_pcb();
+    let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
+    let (rq, guard) = rq.self_lock();
+
+    // TODO: schedstat_inc(rq->yld_count);
+
+    match pcb.sched_info().policy() {
+        SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
+        SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
+        SchedPolicy::RT => rq.resched_current(),
+        SchedPolicy::IDLE => {}
+    }
+
+    pcb.preempt_disable();
+
+    drop(guard);
+    drop(irq_guard);
+
+    pcb.preempt_enable(); // sched_preempt_enable_no_resched();
+
+    schedule(SchedMode::SM_NONE);
 }

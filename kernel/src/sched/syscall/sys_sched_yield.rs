@@ -7,7 +7,7 @@ use crate::exception::InterruptArch;
 use crate::process::ProcessManager;
 use crate::sched::fair::CompletelyFairScheduler;
 use crate::sched::fifo::FifoScheduler;
-use crate::sched::CurrentIrqArch;
+use crate::sched::{CurrentIrqArch, sched_yield};
 use crate::sched::{cpu_rq, schedule, SchedMode, SchedPolicy, Scheduler};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -37,31 +37,7 @@ impl Syscall for SysSchedYield {
     /// # Returns
     /// * `Ok(0)`: Success
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        // 禁用中断
-        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-        let pcb = ProcessManager::current_pcb();
-        let rq = cpu_rq(pcb.sched_info().on_cpu().unwrap_or(current_cpu_id()).data() as usize);
-        let (rq, guard) = rq.self_lock();
-
-        // TODO: schedstat_inc(rq->yld_count);
-
-        match pcb.sched_info().policy() {
-            SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
-            SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
-            SchedPolicy::RT => rq.resched_current(),
-            SchedPolicy::IDLE => {}
-        }
-
-        pcb.preempt_disable();
-
-        drop(guard);
-        drop(irq_guard);
-
-        pcb.preempt_enable(); // sched_preempt_enable_no_resched();
-
-        schedule(SchedMode::SM_NONE);
-
+        sched_yield();
         Ok(0)
     }
 
