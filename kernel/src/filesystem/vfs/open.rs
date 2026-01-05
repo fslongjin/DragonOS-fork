@@ -374,7 +374,7 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
 /// ## 返回值
 /// - `Ok((Arc<File>, i32))`: 成功打开的文件和分配的文件描述符
 /// - `Err(SystemError)`: 错误
-pub fn do_open_execat(dirfd: i32, path: &str) -> Result<(Arc<File>, i32), SystemError> {
+pub fn do_open_execat(dirfd: i32, path: &str) -> Result<Arc<File>, SystemError> {
     let path = path.trim();
     if path.is_empty() {
         return Err(SystemError::ENOENT);
@@ -401,20 +401,7 @@ pub fn do_open_execat(dirfd: i32, path: &str) -> Result<(Arc<File>, i32), System
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
     let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
 
-    // 将文件加入文件描述符表
-    let fd = ProcessManager::current_pcb()
-        .fd_table()
-        .write()
-        .alloc_fd(file, None)?;
-
-    // 从文件描述符表中获取 Arc<File> 并返回
-    let file_arc = ProcessManager::current_pcb()
-        .fd_table()
-        .read()
-        .get_file_by_fd(fd)
-        .ok_or(SystemError::EBADF)?;
-
-    Ok((file_arc, fd))
+    Ok(Arc::new(file))
 }
 
 /// On Linux, futimens() is a library function implemented on top of

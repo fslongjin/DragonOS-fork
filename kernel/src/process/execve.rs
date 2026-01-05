@@ -37,8 +37,8 @@ pub fn do_execve(
     // 保存原始脚本路径（用于shebang场景）
     ctx.original_path = Some(path.into());
 
-    // 通过正常的open流程打开文件，并加入文件描述符表
-    let (file, _fd) = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
+    // 通过正常的open流程打开文件
+    let file = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
 
     do_execve_internal(file, argv, envp, regs, ctx)
 }

@@ -291,8 +291,8 @@ pub fn load_binary_file_with_context(
         let shebang_info =
             ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
 
-        // 通过正常的open流程打开解释器文件，并加入文件描述符表
-        let (interpreter_file, _interp_fd) =
+        // 通过正常的open流程打开解释器文件
+        let interpreter_file =
             do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
                 |e| {
                     log::warn!(

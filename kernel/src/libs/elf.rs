@@ -799,9 +799,9 @@ impl BinaryLoader for ElfLoader {
                     e
                 ))
             })?;
-            // 使用 do_open_execat 打开解释器文件，并加入文件描述符表
-            let (interpreter_file, _interp_fd) =
-                do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path).map_err(|e| {
+            // 使用 do_open_execat 打开解释器文件
+            let interpreter_file = do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path)
+                .map_err(|e| {
                     // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
                     log::error!(
                         "Failed to open interpreter file: {} (err={:?})",
