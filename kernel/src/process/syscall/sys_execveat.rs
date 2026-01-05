@@ -62,7 +62,9 @@ impl Syscall for SysExecveAt {
             }
 
             // 获取文件的绝对路径
-            file.inode().absolute_path().map_err(|_| SystemError::ENOENT)?
+            file.inode()
+                .absolute_path()
+                .map_err(|_| SystemError::ENOENT)?
         } else {
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd as _, &path)?;

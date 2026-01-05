@@ -1,10 +1,9 @@
-use alloc::string::String;
 #[allow(unused_imports)]
 use alloc::string::ToString;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
-use crate::filesystem::vfs::{IndexNode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
+use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
 use crate::mm::page::PAGE_4K_SIZE;
 use crate::mm::{access_ok, VirtAddr};
 use crate::process::execve::do_execve;
