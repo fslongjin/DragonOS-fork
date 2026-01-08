@@ -389,6 +389,7 @@ impl TcpSocket {
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
+        self.mark_close_called();
         let mut writer = self.inner.write();
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
@@ -430,7 +431,18 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.iface().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                es.close();
+                let unread = es.with(|socket| socket.recv_queue());
+                if unread > 0 {
+                    es.with_mut(|socket| socket.abort());
+                    if let Some(netns) = iface.common().net_namespace() {
+                        netns.wakeup_poll_thread();
+                    }
+                    for _ in 0..32 {
+                        iface.poll();
+                    }
+                } else {
+                    es.close();
+                }
                 iface.common().defer_tcp_close(handle, local_port, me);
                 writer.replace(inner::Inner::Established(es));
             }

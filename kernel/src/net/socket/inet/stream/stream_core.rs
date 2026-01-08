@@ -1,6 +1,7 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
+use num_traits::FromPrimitive;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, InodeId};
@@ -86,6 +87,8 @@ pub struct TcpSocket {
     pub(crate) epoll_items: EPollItems,
     pub(crate) fasync_items: FAsyncItems,
     pub(crate) options: TcpSocketOptions,
+    pub(crate) close_called: AtomicBool,
+    pub(crate) pending_error: AtomicI32,
 }
 
 impl TcpSocket {
@@ -109,6 +112,8 @@ impl TcpSocket {
             epoll_items: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             options: TcpSocketOptions::new(),
+            close_called: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
         }
     }
 
@@ -170,6 +175,52 @@ impl TcpSocket {
                 _ => inner.with_socket(|s| s.recv_queue()),
             })
             .unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn mark_close_called(&self) {
+        self.close_called
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn close_called(&self) -> bool {
+        self.close_called
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_pending_error(&self, err: SystemError) {
+        let _ = self.pending_error.compare_exchange(
+            0,
+            err as i32,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    #[inline]
+    pub(crate) fn pending_error(&self) -> Option<SystemError> {
+        let v = self
+            .pending_error
+            .load(core::sync::atomic::Ordering::Acquire);
+        if v == 0 {
+            None
+        } else {
+            FromPrimitive::from_i32(v)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn take_pending_error(&self) -> Option<SystemError> {
+        let v = self
+            .pending_error
+            .swap(0, core::sync::atomic::Ordering::AcqRel);
+        if v == 0 {
+            None
+        } else {
+            FromPrimitive::from_i32(v)
+        }
     }
 
     #[inline]

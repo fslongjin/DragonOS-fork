@@ -1,5 +1,6 @@
 use super::inner;
 use super::TcpSocket;
+use system_error::SystemError;
 
 type EP = crate::filesystem::epoll::EPollEventType;
 
@@ -28,6 +29,17 @@ impl TcpSocket {
             Some(inner::Inner::Connecting(connecting)) => connecting.update_io_events(&self.pollee),
             Some(inner::Inner::Established(established)) => {
                 established.update_io_events(&self.pollee);
+
+                let state = established.with(|socket| socket.state());
+                if matches!(state, smoltcp::socket::tcp::State::Closed) && !self.close_called() {
+                    self.set_pending_error(SystemError::ECONNRESET);
+                }
+                if self.pending_error().is_some() {
+                    self.pollee.fetch_or(
+                        EP::EPOLLERR.bits() as usize,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
 
                 // If SHUT_WR, set EPOLLOUT so send() wakes up and returns EPIPE.
                 if self.is_send_shutdown() {

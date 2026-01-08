@@ -60,8 +60,13 @@ impl TcpSocket {
                                     | smoltcp::socket::tcp::State::LastAck
                                     | smoltcp::socket::tcp::State::Closing
                                     | smoltcp::socket::tcp::State::TimeWait
-                                    | smoltcp::socket::tcp::State::Closed
                             ) {
+                                return Ok(0);
+                            }
+                            if matches!(state, smoltcp::socket::tcp::State::Closed) {
+                                if let Some(err) = self.take_pending_error() {
+                                    return Err(err);
+                                }
                                 return Ok(0);
                             }
 

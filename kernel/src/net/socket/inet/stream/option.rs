@@ -401,6 +401,9 @@ impl super::TcpSocket {
                         }
                         err
                     }
+                    Some(inner::Inner::Established(_)) | Some(inner::Inner::Closed(_)) => {
+                        self.take_pending_error().map(|e| -(e as i32)).unwrap_or(0)
+                    }
                     _ => 0,
                 };
                 Self::write_i32_opt(value, err)
