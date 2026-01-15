@@ -1,16 +1,13 @@
 /// 引入Module
-use crate::driver::{
-    base::{
-        device::{
-            device_number::{DeviceNumber, Major},
-            DevName, Device, DeviceError, IdTable, BLOCKDEVS,
-        },
-        map::{
-            DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
-            DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
-        },
+use crate::driver::base::{
+    device::{
+        device_number::{DeviceNumber, Major},
+        DevName, Device, DeviceError, IdTable, BLOCKDEVS,
     },
-    block::cache::{cached_block_device::BlockCache, BlockCacheError, BLOCK_SIZE},
+    map::{
+        DeviceStruct, DEV_MAJOR_DYN_END, DEV_MAJOR_DYN_EXT_END, DEV_MAJOR_DYN_EXT_START,
+        DEV_MAJOR_HASH_SIZE, DEV_MAJOR_MAX,
+    },
 };
 
 use alloc::{sync::Arc, vec::Vec};
@@ -18,7 +15,7 @@ use core::any::Any;
 use log::error;
 use system_error::SystemError;
 
-use super::{disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
+use super::{disk_cache::DiskCache, disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
 
 // 该文件定义了 Device 和 BlockDevice 的接口
 // Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -285,6 +282,14 @@ pub trait BlockDevice: Device {
     /// @brief 返回当前磁盘上的所有分区的Arc指针数组
     fn partitions(&self) -> Vec<Arc<Partition>>;
 
+    /// 获取设备的磁盘缓存（懒初始化）
+    ///
+    /// 默认返回None，由具体驱动实现。
+    /// 实现此方法后，read_at/write_at将自动使用缓存。
+    fn disk_cache(&self) -> Option<Arc<DiskCache>> {
+        None
+    }
+
     /// # 函数的功能
     /// 经由Cache对块设备的读操作
     fn read_at(
@@ -293,7 +298,13 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
-        self.cache_read(lba_id_start, count, buf)
+        // 优先使用新的DiskCache
+        if let Some(cache) = self.disk_cache() {
+            let byte_offset = lba_id_start * LBA_SIZE;
+            return cache.read(byte_offset, buf);
+        }
+        // 无缓存时直接同步读取
+        self.read_at_sync(lba_id_start, count, buf)
     }
 
     /// # 函数的功能
@@ -304,49 +315,12 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
-        self.cache_write(lba_id_start, count, buf)
-    }
-
-    /// # 函数的功能
-    /// 其功能对外而言和read_at函数完全一致，但是加入blockcache的功能
-    fn cache_read(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &mut [u8],
-    ) -> Result<usize, SystemError> {
-        let cache_response = BlockCache::read(lba_id_start, count, buf);
-        if let Err(e) = cache_response {
-            match e {
-                BlockCacheError::StaticParameterError => {
-                    BlockCache::init();
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-                BlockCacheError::BlockFaultError(fail_vec) => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    let _ = BlockCache::insert(fail_vec, buf);
-                    return Ok(ans);
-                }
-                _ => {
-                    let ans = self.read_at_sync(lba_id_start, count, buf)?;
-                    return Ok(ans);
-                }
-            }
-        } else {
-            return Ok(count * BLOCK_SIZE);
+        // 优先使用新的DiskCache
+        if let Some(cache) = self.disk_cache() {
+            let byte_offset = lba_id_start * LBA_SIZE;
+            return cache.write(byte_offset, buf);
         }
-    }
-
-    /// # 函数功能
-    /// 其功能对外而言和write_at函数完全一致，但是加入blockcache的功能
-    fn cache_write(
-        &self,
-        lba_id_start: BlockId,
-        count: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        let _cache_response = BlockCache::immediate_write(lba_id_start, count, buf);
+        // 无缓存时直接同步写入
         self.write_at_sync(lba_id_start, count, buf)
     }
 

@@ -27,6 +27,7 @@ use crate::{
                 bio::{BioRequest, BioType},
                 bio_queue::BioQueue,
                 block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
+                disk_cache::DiskCache,
                 disk_info::Partition,
                 manager::{block_dev_manager, BlockDevMeta},
             },
@@ -337,6 +338,8 @@ pub struct VirtIOBlkDevice {
     parent: RwLock<Weak<LockedDevFSInode>>,
     fs: RwLock<Weak<DevFS>>,
     metadata: Metadata,
+    /// 磁盘缓存
+    disk_cache: RwLock<Option<Arc<DiskCache>>>,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -397,6 +400,7 @@ impl VirtIOBlkDevice {
                 crate::filesystem::vfs::FileType::BlockDevice,
                 InodeMode::from_bits_truncate(0o755),
             ),
+            disk_cache: RwLock::new(None), // 懒初始化
         });
 
         let device_weak = Arc::downgrade(&dev);
@@ -579,6 +583,36 @@ impl BlockDevice for VirtIOBlkDevice {
         let mbr_table = MbrDiskPartionTable::from_disk(device.clone())
             .expect("Failed to get MBR partition table");
         mbr_table.partitions(Arc::downgrade(&device))
+    }
+
+    /// 获取磁盘缓存（懒初始化）
+    fn disk_cache(&self) -> Option<Arc<DiskCache>> {
+        // 先尝试读取
+        {
+            let guard = self.disk_cache.read();
+            if let Some(cache) = guard.as_ref() {
+                return Some(cache.clone());
+            }
+        }
+
+        // 需要初始化
+        let mut guard = self.disk_cache.write();
+        // 双重检查
+        if let Some(cache) = guard.as_ref() {
+            return Some(cache.clone());
+        }
+
+        // 创建新的缓存
+        match DiskCache::new(self.self_ref.clone() as Weak<dyn BlockDevice>) {
+            Ok(cache) => {
+                *guard = Some(cache.clone());
+                Some(cache)
+            }
+            Err(e) => {
+                log::error!("Failed to create DiskCache for VirtIOBlkDevice: {:?}", e);
+                None
+            }
+        }
     }
 
     /// 提交异步BIO请求
