@@ -26,6 +26,7 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
+use crate::mm::page_wait::{lock_page, unlock_page};
 
 use super::{
     allocator::page_frame::{
@@ -266,7 +267,7 @@ fn page_reclaim_thread() -> i32 {
             page_reclaimer_lock().flush_dirty_pages();
             // 休眠5秒
             // log::info!("sleep");
-            let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
+            let _ = nanosleep(PosixTimeSpec::new(60, 500_000_000));
         }
     }
 }
@@ -330,6 +331,12 @@ impl PageReclaimer {
     /// 在不持有回收器锁的情况下，完成页面写回与回收。
     fn evict_pages(victims: Vec<Arc<Page>>) {
         for page in victims {
+            let mut locked_for_io = false;
+            if page.read().flags().contains(PageFlags::PG_DIRTY) {
+                if lock_page(&page, false).is_ok() {
+                    locked_for_io = true;
+                }
+            }
             let mut guard = page.write();
             if let PageType::File(info) = guard.page_type().clone() {
                 // Never evict a file-backed page that is still mapped into any VMA.
@@ -349,6 +356,9 @@ impl PageReclaimer {
                     Self::page_writeback(&mut guard, true);
                     if guard.flags().contains(PageFlags::PG_DIRTY) {
                         drop(guard);
+                        if locked_for_io {
+                            unlock_page(&page);
+                        }
                         page_reclaimer_lock().insert_page(paddr, &page);
                         continue;
                     }
@@ -362,6 +372,9 @@ impl PageReclaimer {
                     page_cache.lock().remove_page(page_index);
                 }
                 page_manager_lock().remove_page(&paddr);
+            }
+            if locked_for_io {
+                unlock_page(&page);
             }
         }
     }
@@ -468,9 +481,18 @@ impl PageReclaimer {
         // log::info!("flush_dirty_pages");
         let iter = self.lru.iter();
         for (_paddr, page) in iter {
+            let mut locked_for_io = false;
+            if page.read().flags().contains(PageFlags::PG_DIRTY) {
+                if lock_page(&page, false).is_ok() {
+                    locked_for_io = true;
+                }
+            }
             let mut guard = page.write();
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 Self::page_writeback(&mut guard, false);
+            }
+            if locked_for_io {
+                unlock_page(&page);
             }
         }
     }

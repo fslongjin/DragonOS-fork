@@ -6,12 +6,15 @@ use core::{
 };
 
 use alloc::sync::Arc;
+use system_error::SystemError;
 
 use crate::{
     arch::{mm::PageMapper, MMArch},
+    filesystem::page_cache::PageFetchResult,
     libs::align::align_down,
     mm::{
         page::{page_manager_lock, EntryFlags},
+        page_wait::{unlock_page, wait_on_page_locked},
         ucontext::LockedVMA,
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -694,48 +697,84 @@ impl PageFaultHandler {
         let backing_pgoff = pfm.backing_pgoff.expect("no backing_pgoff");
         let mut ret = VmFaultReason::empty();
 
-        let page = page_cache.lock().get_page(backing_pgoff);
-        if let Some(page) = page {
-            // TODO 异步从磁盘中预读页面进PageCache
+        loop {
+            let fetch = {
+                let mut pc = page_cache.lock();
+                pc.get_or_create_locked_page(backing_pgoff)
+            };
 
-            // 直接将PageCache中的页面作为要映射的页面
-            pfm.page = Some(page.clone());
-        } else {
-            // TODO 同步预读
-            // 涉及磁盘IO，返回标志为VM_FAULT_MAJOR
-            ret = VmFaultReason::VM_FAULT_MAJOR;
-            let mut buffer = vec![0u8; MMArch::PAGE_SIZE];
-            match file.pread(
-                backing_pgoff * MMArch::PAGE_SIZE,
-                MMArch::PAGE_SIZE,
-                buffer.as_mut_slice(),
-            ) {
-                Ok(read_len) => {
-                    // 超出文件末尾，返回SIGBUS而不是panic
-                    if read_len == 0 {
+            match fetch {
+                Ok(PageFetchResult::Ready(page)) => {
+                    if page.read().flags().contains(PageFlags::PG_ERROR) {
                         return VmFaultReason::VM_FAULT_SIGBUS;
                     }
+                    pfm.page = Some(page);
+                    return ret;
                 }
-                Err(e) => {
-                    log::warn!(
-                        "filemap_fault: pread failed at pgoff {}, err {:?}",
-                        backing_pgoff,
-                        e
-                    );
-                    return VmFaultReason::VM_FAULT_SIGBUS;
+                Ok(PageFetchResult::Wait(page)) => {
+                    if let Err(wait_err) = wait_on_page_locked(
+                        &page,
+                        pfm.flags.contains(FaultFlags::FAULT_FLAG_INTERRUPTIBLE),
+                    ) {
+                        if wait_err == SystemError::ERESTARTSYS
+                            && pfm.flags.contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
+                        {
+                            return VmFaultReason::VM_FAULT_RETRY;
+                        }
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
+                    continue;
                 }
-            }
-            drop(buffer);
+                Ok(PageFetchResult::NeedIo(page)) => {
+                    ret = VmFaultReason::VM_FAULT_MAJOR;
+                    let inode = file.inode();
+                    let mut page_guard = page.write();
+                    let page_buf = unsafe { page_guard.as_slice_mut() };
+                    let mut filled = 0;
+                    let mut io_err = None;
+                    while filled < MMArch::PAGE_SIZE {
+                        match inode.read_sync(
+                            backing_pgoff * MMArch::PAGE_SIZE + filled,
+                            &mut page_buf[filled..],
+                        ) {
+                            Ok(0) => break,
+                            Ok(read_len) => {
+                                filled += read_len;
+                            }
+                            Err(e) => {
+                                io_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = io_err {
+                        log::warn!(
+                            "filemap_fault: read_sync failed at pgoff {}, err {:?}",
+                            backing_pgoff,
+                            e
+                        );
+                        page_guard.add_flags(PageFlags::PG_ERROR);
+                    } else if filled == 0 {
+                        page_guard.add_flags(PageFlags::PG_ERROR);
+                    } else {
+                        if filled < MMArch::PAGE_SIZE {
+                            page_buf[filled..].fill(0);
+                        }
+                        page_guard.remove_flags(PageFlags::PG_ERROR);
+                        page_guard.add_flags(PageFlags::PG_UPTODATE);
+                    }
+                    drop(page_guard);
+                    unlock_page(&page);
 
-            let page = page_cache.lock().get_page(backing_pgoff);
-            if let Some(page) = page {
-                pfm.page = Some(page);
-            } else {
-                // 读取后仍未获取到页面，视为错误
-                return VmFaultReason::VM_FAULT_SIGBUS;
+                    if page.read().flags().contains(PageFlags::PG_ERROR) {
+                        return VmFaultReason::VM_FAULT_SIGBUS;
+                    }
+                    pfm.page = Some(page);
+                    return ret;
+                }
+                Err(_) => return VmFaultReason::VM_FAULT_OOM,
             }
         }
-        ret
     }
 
     /// 纯 page-cache 后端的缺页处理（不走 pread/磁盘 IO）。

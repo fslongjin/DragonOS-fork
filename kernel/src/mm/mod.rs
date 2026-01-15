@@ -33,6 +33,7 @@ pub mod mmio_buddy;
 pub mod no_init;
 pub mod page;
 pub mod percpu;
+pub mod page_wait;
 pub mod readahead;
 pub mod syscall;
 pub mod sysfs;

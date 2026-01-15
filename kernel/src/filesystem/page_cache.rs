@@ -23,6 +23,7 @@ use crate::{
     },
 };
 use crate::{libs::align::page_align_up, mm::page::PageType};
+use crate::mm::page_wait::{lock_page, unlock_page, wait_on_page_locked};
 
 static PAGE_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
 /// 页面缓存
@@ -47,6 +48,14 @@ pub struct CopyItem {
     page: Arc<Page>,
     page_offset: usize,
     sub_len: usize,
+    need_read: bool,
+    prelocked: bool,
+}
+
+pub enum PageFetchResult {
+    Ready(Arc<Page>),
+    NeedIo(Arc<Page>),
+    Wait(Arc<Page>),
 }
 
 impl InnerPageCache {
@@ -55,6 +64,18 @@ impl InnerPageCache {
             id,
             pages: HashMap::new(),
             page_cache_ref,
+        }
+    }
+
+    fn base_page_flags(&self) -> PageFlags {
+        let cache = self
+            .page_cache_ref
+            .upgrade()
+            .expect("failed to get self_arc of pagecache");
+        if cache.unevictable.load(Ordering::Relaxed) {
+            PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
+        } else {
+            PageFlags::PG_LRU
         }
     }
 
@@ -83,17 +104,11 @@ impl InnerPageCache {
             let buf_offset = i * MMArch::PAGE_SIZE;
             let page_index = start_page_index + i;
 
-            let page_flags = {
-                let cache = self
-                    .page_cache_ref
-                    .upgrade()
-                    .expect("failed to get self_arc of pagecache");
-                if cache.unevictable.load(Ordering::Relaxed) {
-                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
-                } else {
-                    PageFlags::PG_LRU
-                }
-            };
+            if self.pages.contains_key(&page_index) {
+                continue;
+            }
+
+            let page_flags = self.base_page_flags();
 
             let page = page_manager_guard.create_one_page(
                 PageType::File(FileMapInfo {
@@ -111,6 +126,7 @@ impl InnerPageCache {
                 let dst = page_guard.as_slice_mut();
                 dst[..page_len].copy_from_slice(&buf[buf_offset..buf_offset + page_len]);
             }
+            page_guard.add_flags(PageFlags::PG_UPTODATE);
 
             self.add_page(start_page_index + i, &page);
         }
@@ -139,17 +155,11 @@ impl InnerPageCache {
         for i in 0..page_num {
             let page_index = start_page_index + i;
 
-            let page_flags = {
-                let cache = self
-                    .page_cache_ref
-                    .upgrade()
-                    .expect("failed to get self_arc of pagecache");
-                if cache.unevictable.load(Ordering::Relaxed) {
-                    PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE
-                } else {
-                    PageFlags::PG_LRU
-                }
-            };
+            if self.pages.contains_key(&page_index) {
+                continue;
+            }
+
+            let page_flags = self.base_page_flags();
 
             let page = page_manager_guard.create_one_page(
                 PageType::File(FileMapInfo {
@@ -164,6 +174,7 @@ impl InnerPageCache {
             unsafe {
                 page_guard.as_slice_mut().fill(0);
             }
+            page_guard.add_flags(PageFlags::PG_UPTODATE);
 
             self.add_page(page_index, &page);
         }
@@ -171,123 +182,43 @@ impl InnerPageCache {
         Ok(())
     }
 
-    /// 从PageCache中读取数据。
-    ///
-    /// ## 参数
-    ///
-    /// - `offset` 偏移量
-    /// - `buf` 缓冲区
-    ///
-    /// ## 返回值
-    ///
-    /// - `Ok(usize)` 成功读取的长度
-    /// - `Err(SystemError)` 失败返回错误码
-    fn prepare_read(
-        &mut self,
-        offset: usize,
-        buf_len: usize,
-    ) -> Result<(Vec<CopyItem>, usize), SystemError> {
-        let inode: Arc<dyn IndexNode> = self
-            .page_cache_ref
-            .upgrade()
-            .unwrap()
-            .inode
-            .upgrade()
-            .unwrap();
-
-        let file_size = inode.metadata().unwrap().size;
-
-        let len = if offset < file_size as usize {
-            core::cmp::min(file_size as usize, offset + buf_len) - offset
-        } else {
-            0
-        };
-
-        if len == 0 {
-            return Ok((Vec::new(), 0));
-        }
-
-        let mut not_exist = Vec::new();
-        let mut copies: Vec<CopyItem> = Vec::new();
-
-        let start_page_index = offset >> MMArch::PAGE_SHIFT;
-        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
-
-        let mut ret = 0;
-        for i in 0..page_num {
-            let page_index = start_page_index + i;
-
-            // 第一个页可能需要计算页内偏移
-            let page_offset = if i == 0 {
-                offset % MMArch::PAGE_SIZE
-            } else {
-                0
-            };
-
-            // 第一个页和最后一个页可能不满
-            let sub_len = if i == 0 {
-                min(len, MMArch::PAGE_SIZE - page_offset)
-            } else if i == page_num - 1 {
-                (offset + len - 1) % MMArch::PAGE_SIZE + 1
-            } else {
-                MMArch::PAGE_SIZE
-            };
-
-            if let Some(page) = self.get_page(page_index) {
-                copies.push(CopyItem {
-                    page,
-                    page_offset,
-                    sub_len,
-                });
-                ret += sub_len;
-            } else if let Some((index, count)) = not_exist.last_mut() {
-                if *index + *count == page_index {
-                    *count += 1;
-                } else {
-                    not_exist.push((page_index, 1));
-                }
-            } else {
-                not_exist.push((page_index, 1));
-            }
-        }
-
-        for (page_index, count) in not_exist {
-            // TODO 这里使用buffer避免多次读取磁盘，将来引入异步IO直接写入页面，减少内存开销和拷贝
-            let mut page_buf = vec![0u8; MMArch::PAGE_SIZE * count];
-
-            inode.read_sync(page_index * MMArch::PAGE_SIZE, page_buf.as_mut())?;
-
-            self.create_pages(page_index, page_buf.as_mut())?;
-
-            // 实际要拷贝的内容在文件中的偏移量
-            let copy_offset = core::cmp::max(page_index * MMArch::PAGE_SIZE, offset);
-            // 实际要拷贝的内容的长度
-            let copy_len = core::cmp::min((page_index + count) * MMArch::PAGE_SIZE, offset + len)
-                - copy_offset;
-
-            // 为每个新建的页生成拷贝项
-            for i in 0..count {
-                let pg_index = page_index + i;
-                let page = self
-                    .get_page(pg_index)
-                    .expect("page must exist after create_pages");
-                let page_start = pg_index * MMArch::PAGE_SIZE;
-                let sub_start = core::cmp::max(copy_offset, page_start);
-                let sub_end =
-                    core::cmp::min(copy_offset + copy_len, page_start + MMArch::PAGE_SIZE);
-                if sub_end > sub_start {
-                    copies.push(CopyItem {
-                        page,
-                        page_offset: sub_start - page_start,
-                        sub_len: sub_end - sub_start,
-                    });
-                    ret += sub_end - sub_start;
-                }
-            }
-        }
-
-        Ok((copies, ret))
+    pub fn create_empty_page(&mut self, page_index: usize) -> Result<Arc<Page>, SystemError> {
+        let mut page_manager_guard = page_manager_lock();
+        let page_flags = self.base_page_flags();
+        let page = page_manager_guard.create_one_page(
+            PageType::File(FileMapInfo {
+                page_cache: self.page_cache_ref.clone(),
+                index: page_index,
+            }),
+            page_flags,
+            &mut LockedFrameAllocator,
+        )?;
+        self.add_page(page_index, &page);
+        Ok(page)
     }
+
+    pub fn get_or_create_locked_page(
+        &mut self,
+        page_index: usize,
+    ) -> Result<PageFetchResult, SystemError> {
+        if let Some(page) = self.get_page(page_index) {
+            let flags = *page.read().flags();
+            if flags.contains(PageFlags::PG_LOCKED) {
+                page.write().add_flags(PageFlags::PG_WAITERS);
+                return Ok(PageFetchResult::Wait(page));
+            }
+            if flags.contains(PageFlags::PG_UPTODATE) || flags.contains(PageFlags::PG_ERROR) {
+                return Ok(PageFetchResult::Ready(page));
+            }
+            page.write().add_flags(PageFlags::PG_LOCKED);
+            return Ok(PageFetchResult::NeedIo(page));
+        }
+
+        let page = self.create_empty_page(page_index)?;
+        page.write().add_flags(PageFlags::PG_LOCKED);
+        Ok(PageFetchResult::NeedIo(page))
+    }
+
 
     /// 向PageCache中写入数据。
     ///
@@ -336,11 +267,14 @@ impl InnerPageCache {
             };
 
             let mut page = self.get_page(page_index);
+            let mut prelocked = false;
+            let need_read = page_offset != 0 || sub_len != MMArch::PAGE_SIZE;
 
             if page.is_none() {
-                let page_buf = vec![0u8; MMArch::PAGE_SIZE];
-                self.create_pages(page_index, &page_buf)?;
-                page = self.get_page(page_index);
+                let new_page = self.create_empty_page(page_index)?;
+                new_page.write().add_flags(PageFlags::PG_LOCKED);
+                page = Some(new_page);
+                prelocked = true;
             }
 
             if let Some(page) = page {
@@ -348,6 +282,8 @@ impl InnerPageCache {
                     page,
                     page_offset,
                     sub_len,
+                    need_read,
+                    prelocked,
                 });
                 ret += sub_len;
             } else {
@@ -455,6 +391,76 @@ impl Drop for InnerPageCache {
 }
 
 impl PageCache {
+    fn load_read_page(
+        &self,
+        page_index: usize,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<Arc<Page>, SystemError> {
+        loop {
+            let fetch = {
+                let mut guard = self.inner.lock();
+                guard.get_or_create_locked_page(page_index)?
+            };
+
+            match fetch {
+                PageFetchResult::Ready(page) => {
+                    if page.read().flags().contains(PageFlags::PG_ERROR) {
+                        return Err(SystemError::EIO);
+                    }
+                    return Ok(page);
+                }
+                PageFetchResult::Wait(page) => {
+                    wait_on_page_locked(&page, false)?;
+                    if page.read().flags().contains(PageFlags::PG_ERROR) {
+                        return Err(SystemError::EIO);
+                    }
+                    continue;
+                }
+                PageFetchResult::NeedIo(page) => {
+                    let mut page_guard = page.write();
+                    let page_buf = unsafe { page_guard.as_slice_mut() };
+                    let mut filled = 0;
+                    let mut io_err = None;
+                    while filled < MMArch::PAGE_SIZE {
+                        match inode.read_sync(
+                            page_index * MMArch::PAGE_SIZE + filled,
+                            &mut page_buf[filled..],
+                        ) {
+                            Ok(0) => break,
+                            Ok(read_len) => {
+                                filled += read_len;
+                            }
+                            Err(e) => {
+                                io_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = io_err {
+                        page_guard.add_flags(PageFlags::PG_ERROR);
+                        drop(page_guard);
+                        unlock_page(&page);
+                        return Err(e);
+                    }
+                    if filled == 0 {
+                        page_guard.add_flags(PageFlags::PG_ERROR);
+                        drop(page_guard);
+                        unlock_page(&page);
+                        return Err(SystemError::EIO);
+                    }
+                    if filled < MMArch::PAGE_SIZE {
+                        page_buf[filled..].fill(0);
+                    }
+                    page_guard.remove_flags(PageFlags::PG_ERROR);
+                    page_guard.add_flags(PageFlags::PG_UPTODATE);
+                    drop(page_guard);
+                    unlock_page(&page);
+                    return Ok(page);
+                }
+            }
+        }
+    }
+
     pub fn new(inode: Option<Weak<dyn IndexNode>>) -> Arc<PageCache> {
         let id = PAGE_CACHE_ID.fetch_add(1, Ordering::SeqCst);
         Arc::new_cyclic(|weak| Self {
@@ -502,10 +508,53 @@ impl PageCache {
 
     /// 两阶段读取：持锁收集拷贝项，解锁后拷贝到目标缓冲区，避免用户缺页导致自锁
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let (copies, ret) = {
-            let mut guard = self.inner.lock();
-            guard.prepare_read(offset, buf.len())?
+        let inode: Arc<dyn IndexNode> = self
+            .inode
+            .try_get()
+            .and_then(|inode| inode.upgrade())
+            .ok_or(SystemError::EIO)?;
+
+        let file_size = inode.metadata()?.size.max(0) as usize;
+        let len = if offset < file_size {
+            core::cmp::min(file_size, offset + buf.len()) - offset
+        } else {
+            0
         };
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let start_page_index = offset >> MMArch::PAGE_SHIFT;
+        let page_num = (page_align_up(offset + len) >> MMArch::PAGE_SHIFT) - start_page_index;
+
+        let mut copies: Vec<CopyItem> = Vec::new();
+        let mut ret = 0;
+        for i in 0..page_num {
+            let page_index = start_page_index + i;
+            let page_offset = if i == 0 {
+                offset % MMArch::PAGE_SIZE
+            } else {
+                0
+            };
+            let sub_len = if i == 0 {
+                min(len, MMArch::PAGE_SIZE - page_offset)
+            } else if i == page_num - 1 {
+                (offset + len - 1) % MMArch::PAGE_SIZE + 1
+            } else {
+                MMArch::PAGE_SIZE
+            };
+
+            let page = self.load_read_page(page_index, &inode)?;
+            copies.push(CopyItem {
+                page,
+                page_offset,
+                sub_len,
+                need_read: false,
+                prelocked: false,
+            });
+            ret += sub_len;
+        }
 
         let mut dst_offset = 0;
         for item in copies {
@@ -513,6 +562,9 @@ impl PageCache {
             let byte = volatile_read!(buf[dst_offset]);
             volatile_write!(buf[dst_offset], byte);
             let page_guard = item.page.read();
+            if page_guard.flags().contains(PageFlags::PG_ERROR) {
+                return Err(SystemError::EIO);
+            }
             unsafe {
                 buf[dst_offset..dst_offset + item.sub_len].copy_from_slice(
                     &page_guard.as_slice()[item.page_offset..item.page_offset + item.sub_len],
@@ -531,16 +583,60 @@ impl PageCache {
             guard.write(offset, buf)?
         };
 
+        let inode = self
+            .inode
+            .try_get()
+            .and_then(|inode| inode.upgrade());
+
         let mut src_offset = 0;
         for item in copies {
             // 预触发用户缓冲区当前段，避免后续在持页锁时缺页
             let _ = volatile_read!(buf[src_offset]);
+            if !item.prelocked {
+                lock_page(&item.page, false)?;
+            }
             let mut page_guard = item.page.write();
+            if item.need_read && !page_guard.flags().contains(PageFlags::PG_UPTODATE) {
+                let inode = inode.as_ref().ok_or(SystemError::EIO)?;
+                let page_buf = unsafe { page_guard.as_slice_mut() };
+                let page_start = (offset + src_offset - item.page_offset) & !(MMArch::PAGE_SIZE - 1);
+                let mut filled = 0;
+                let mut io_err = None;
+                while filled < MMArch::PAGE_SIZE {
+                    match inode.read_sync(page_start + filled, &mut page_buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(read_len) => {
+                            filled += read_len;
+                        }
+                        Err(e) => {
+                            io_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = io_err {
+                    page_guard.add_flags(PageFlags::PG_ERROR);
+                    drop(page_guard);
+                    unlock_page(&item.page);
+                    return Err(e);
+                }
+                if filled < MMArch::PAGE_SIZE {
+                    page_buf[filled..].fill(0);
+                }
+                if filled == 0 {
+                    page_guard.add_flags(PageFlags::PG_ERROR);
+                    drop(page_guard);
+                    unlock_page(&item.page);
+                    return Err(SystemError::EIO);
+                }
+            }
             unsafe {
                 page_guard.as_slice_mut()[item.page_offset..item.page_offset + item.sub_len]
                     .copy_from_slice(&buf[src_offset..src_offset + item.sub_len]);
             }
-            page_guard.add_flags(PageFlags::PG_DIRTY);
+            page_guard.add_flags(PageFlags::PG_DIRTY | PageFlags::PG_UPTODATE);
+            drop(page_guard);
+            unlock_page(&item.page);
             src_offset += item.sub_len;
         }
 
