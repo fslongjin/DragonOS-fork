@@ -918,6 +918,12 @@ pub enum RestartBlockData {
         deadline: crate::time::PosixTimeSpec,
         clockid: crate::time::syscall::PosixClockID,
     },
+    Semtimedop {
+        semid: usize,
+        tsops_ptr: VirtAddr,
+        nsops: usize,
+        deadline_jiffies: u64,
+    },
     // todo: futex_wait
     FutexWait(),
 }

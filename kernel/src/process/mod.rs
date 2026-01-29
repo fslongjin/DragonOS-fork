@@ -36,6 +36,7 @@ use crate::{
     },
     ipc::{
         sighand::SigHand,
+        semaphore::sysv::undo::SemUndoList,
         signal::RestartBlock,
         signal_types::{SigCode, SigInfo, SigPending, SigType, SignalFlags},
     },
@@ -48,6 +49,7 @@ use crate::{
         lock_free_flags::LockFreeFlags,
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
         rwsem::RwSem,
+        mutex::Mutex,
         spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
@@ -654,6 +656,7 @@ impl ProcessManager {
             compiler_fence(Ordering::SeqCst);
 
             RobustListHead::exit_robust_list(pcb.clone());
+            crate::ipc::semaphore::sysv::undo::apply_sem_undo_on_exit(&pcb);
             // 如果是vfork出来的进程，则需要处理completion
             if let Some(vd) = vfork_done {
                 vd.complete_all();
@@ -1147,6 +1150,9 @@ pub struct ProcessControlBlock {
     /// rseq（Restartable Sequences）状态
     rseq_state: RwLock<rseq::RseqState>,
 
+    /// SysV semaphore undo 列表
+    pub(crate) sem_undo: Mutex<SemUndoList>,
+
     /// 进程作为主体的凭证集
     cred: SpinLock<Arc<Cred>>,
     self_ref: Weak<ProcessControlBlock>,
@@ -1281,6 +1287,7 @@ impl ProcessControlBlock {
                 cpu_time: Arc::new(ProcessCpuTime::default()),
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),
+                sem_undo: Mutex::new(SemUndoList::default()),
                 cred: SpinLock::new(cred),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),

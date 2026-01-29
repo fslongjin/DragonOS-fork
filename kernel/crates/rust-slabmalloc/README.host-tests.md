@@ -7,7 +7,7 @@
 在本 crate 目录运行：
 
 ```bash
-cd /home/jinlong/code/DragonOS/kernel/crates/rust-slabmalloc
+cd kernel/crates/rust-slabmalloc
 cargo test
 ```
 

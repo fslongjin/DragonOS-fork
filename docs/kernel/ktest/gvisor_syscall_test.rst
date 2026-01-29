@@ -178,11 +178,6 @@ gVisor 是 Google 开发的容器运行时沙箱，包含了大量的系统调�
 
       cp /path/to/gvisor/test/syscalls/linux/<test_name>.cc /path/to/DragonOS/
 
-   例如，修复socket_test：
-
-   .. code-block:: bash
-
-      cp gvisor/test/syscalls/linux/socket_test.cc /home/jinlong/code/DragonOS/
 
 2. **使用AI助手进行修复**
 
@@ -330,7 +325,7 @@ gVisor 是 Google 开发的容器运行时沙箱，包含了大量的系统调�
    .. code-block:: bash
 
       # 复制源代码到DragonOS根目录
-      cp gvisor/test/syscalls/linux/open_test.cc /home/jinlong/code/DragonOS/
+      cp gvisor/test/syscalls/linux/open_test.cc DragonOS/
       
       # 使用AI助手修复（在Cursor中打开文件并提供错误信息）
       # AI会分析代码并提供修复方案

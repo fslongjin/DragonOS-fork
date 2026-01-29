@@ -1,6 +1,8 @@
 use alloc::sync::{Arc, Weak};
 
+use crate::ipc::semaphore::sysv::SemManager;
 use crate::ipc::shm::ShmManager;
+use crate::libs::mutex::Mutex;
 use crate::libs::spinlock::SpinLock;
 use crate::process::namespace::{
     nsproxy::NsCommon, user_namespace::UserNamespace, NamespaceOps, NamespaceType,
@@ -21,6 +23,8 @@ pub struct IpcNamespace {
 
     /// SysV SHM 管理器（阶段一：仅支持 per-ns shm）
     pub shm: SpinLock<ShmManager>,
+    /// SysV semaphore 管理器（per-ns）
+    pub sem: Mutex<SemManager>,
 }
 
 impl NamespaceOps for IpcNamespace {
@@ -36,6 +40,7 @@ impl IpcNamespace {
             self_ref: weak_self.clone(),
             user_ns: crate::process::namespace::user_namespace::INIT_USER_NAMESPACE.clone(),
             shm: SpinLock::new(ShmManager::new()),
+            sem: Mutex::new(SemManager::new()),
         })
     }
 
@@ -55,6 +60,7 @@ impl IpcNamespace {
             self_ref: weak_self.clone(),
             user_ns,
             shm: SpinLock::new(ShmManager::new()),
+            sem: Mutex::new(SemManager::new()),
         })
     }
 }
