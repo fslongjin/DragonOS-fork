@@ -378,6 +378,22 @@ impl OvlInode {
         }
         false
     }
+
+    fn remove_whiteout_if_present(&self, name: &str) -> Result<bool, SystemError> {
+        let upper_inode = self.upper_inode.lock().clone().ok_or(SystemError::EROFS)?;
+        match upper_inode.find(name) {
+            Ok(inode) => {
+                if Self::is_whiteout_inode(&inode) {
+                    upper_inode.unlink(name)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(SystemError::ENOENT) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl IndexNode for OvlInode {
@@ -550,11 +566,9 @@ impl IndexNode for OvlInode {
         file_type: vfs::FileType,
         mode: vfs::InodeMode,
     ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-        if let Some(ref upper_inode) = *self.upper_inode.lock() {
-            upper_inode.create(name, file_type, mode)
-        } else {
-            Err(SystemError::EROFS)
-        }
+        let upper_inode = self.upper_inode.lock().clone().ok_or(SystemError::EROFS)?;
+        self.remove_whiteout_if_present(name)?;
+        upper_inode.create(name, file_type, mode)
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {

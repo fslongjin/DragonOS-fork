@@ -8,6 +8,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -194,6 +195,89 @@ TEST(MountReconfigure, RemountPreservesAtimeModeWhenUnspecified) {
     EXPECT_FALSE(statfs_has_flag(target, MS_RELATIME));
 
     cleanup_mount(target);
+}
+
+TEST(MountReconfigure, NodevDeviceOpenAllowsOPath) {
+    const char *root = "/tmp/test_mount_nodev_o_path";
+    const char *source = "/tmp/test_mount_nodev_o_path/source";
+    const char *target = "/tmp/test_mount_nodev_o_path/target";
+    char source_dev[256];
+    char target_dev[256];
+    int fd;
+
+    ensure_dir("/tmp");
+    ensure_dir(root);
+    ensure_dir(source);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    snprintf(source_dev, sizeof(source_dev), "%s/null_dev", source);
+    snprintf(target_dev, sizeof(target_dev), "%s/null_dev", target);
+    if (mknod(source_dev, S_IFCHR | 0600, makedev(1, 3)) != 0) {
+        rmdir(target);
+        rmdir(source);
+        rmdir(root);
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    if (mount(source, target, NULL, MS_BIND, NULL) != 0) {
+        unlink(source_dev);
+        rmdir(target);
+        rmdir(source);
+        rmdir(root);
+        FAIL() << strerror(errno);
+    }
+
+    if (mount(target, target, NULL, MS_BIND | MS_REMOUNT | MS_NODEV, NULL) != 0) {
+        umount(target);
+        unlink(source_dev);
+        rmdir(target);
+        rmdir(source);
+        rmdir(root);
+        FAIL() << strerror(errno);
+    }
+
+    fd = open(target_dev, O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        umount(target);
+        unlink(source_dev);
+        rmdir(target);
+        rmdir(source);
+        rmdir(root);
+        FAIL() << "open without O_PATH unexpectedly succeeded on nodev mount";
+    }
+    EXPECT_EQ(EACCES, errno);
+
+    fd = open(target_dev, O_PATH);
+    if (fd < 0) {
+        umount(target);
+        unlink(source_dev);
+        rmdir(target);
+        rmdir(source);
+        rmdir(root);
+        FAIL() << strerror(errno);
+    }
+
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_TRUE(S_ISCHR(st.st_mode));
+
+    char byte = 0;
+    ASSERT_EQ(-1, read(fd, &byte, 1));
+    EXPECT_EQ(EBADF, errno);
+    close(fd);
+
+    umount(target);
+    unlink(source_dev);
+    rmdir(target);
+    rmdir(source);
+    rmdir(root);
 }
 
 TEST(MountReconfigure, SelfBindSubdirRemountReadonly) {

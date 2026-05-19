@@ -315,7 +315,9 @@ fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemE
     let metadata = inode.metadata()?;
     let file_type: FileType = metadata.file_type;
 
-    if file_type == FileType::CharDevice || file_type == FileType::BlockDevice {
+    if !how.o_flags.contains(FileFlags::O_PATH)
+        && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
+    {
         let fs = inode.fs();
         if let Some(mount_fs) = fs.as_any_ref().downcast_ref::<MountFS>() {
             if mount_fs.mount_flags().contains(MountFlags::NODEV) {
