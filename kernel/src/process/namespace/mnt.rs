@@ -92,6 +92,10 @@ impl MntNamespace {
         return result;
     }
 
+    pub fn user_ns(&self) -> &Arc<UserNamespace> {
+        &self._user_ns
+    }
+
     /// 强制替换本MountNamespace的根挂载文件系统
     ///
     /// 本方法仅供dragonos初始化时使用
@@ -399,7 +403,7 @@ impl ProcessManager {
     /// 获取当前进程的挂载namespace
     pub fn current_mntns() -> Arc<MntNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().nsproxy.read().mnt_ns.clone()
+            ProcessManager::current_pcb().nsproxy().mnt_ns.clone()
         } else {
             root_mnt_namespace()
         }
