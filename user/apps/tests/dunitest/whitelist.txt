@@ -11,6 +11,7 @@ normal/test_mount_reconfigure
 normal/test_fchown_o_path
 normal/proc_self_limits
 normal/mlock_semantics
+normal/overlayfs_semantics
 normal/sched_affinity
 normal/sync_file_range
 normal/rcu_selftest

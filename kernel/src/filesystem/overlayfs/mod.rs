@@ -456,15 +456,18 @@ impl IndexNode for OvlInode {
 
     fn list(&self) -> Result<Vec<String>, system_error::SystemError> {
         let mut entries: Vec<String> = Vec::new();
-        let upper_inode = self.upper_inode.lock();
-        if let Some(ref upper_inode) = *upper_inode {
-            let upper_entries = upper_inode.list()?;
-            for entry in upper_entries {
-                if !self.has_whiteout(&entry) {
-                    entries.push(entry);
-                }
+        let upper_entries = if let Some(ref upper_inode) = *self.upper_inode.lock() {
+            upper_inode.list()?
+        } else {
+            Vec::new()
+        };
+
+        for entry in upper_entries {
+            if !self.has_whiteout(&entry) {
+                entries.push(entry);
             }
         }
+
         for lower_inode in &self.lower_inodes {
             let lower_entries = lower_inode.list()?;
             for entry in lower_entries {
@@ -556,12 +559,14 @@ impl IndexNode for OvlInode {
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
         let mut upper_inode = None;
+        let mut upper_file_type = None;
         if let Some(ref upper) = *self.upper_inode.lock() {
             match upper.find(name) {
                 Ok(inode) => {
                     if Self::is_whiteout_inode(&inode) {
                         return Err(SystemError::ENOENT);
                     }
+                    upper_file_type = Some(inode.metadata()?.file_type);
                     upper_inode = Some(inode);
                 }
                 Err(SystemError::ENOENT) => {}
@@ -574,11 +579,30 @@ impl IndexNode for OvlInode {
         }
 
         let mut lower_inodes = Vec::new();
-        for lower in &self.lower_inodes {
-            match lower.find(name) {
-                Ok(inode) => lower_inodes.push(inode),
-                Err(SystemError::ENOENT) => {}
-                Err(err) => return Err(err),
+        if matches!(upper_file_type, None | Some(FileType::Dir)) {
+            let mut merge_dirs = upper_file_type == Some(FileType::Dir);
+            for lower in &self.lower_inodes {
+                match lower.find(name) {
+                    Ok(inode) => {
+                        let lower_file_type = inode.metadata()?.file_type;
+                        if merge_dirs {
+                            if lower_file_type == FileType::Dir {
+                                lower_inodes.push(inode);
+                                continue;
+                            }
+                            break;
+                        }
+
+                        lower_inodes.push(inode);
+                        if lower_file_type == FileType::Dir {
+                            merge_dirs = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(SystemError::ENOENT) => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -586,8 +610,8 @@ impl IndexNode for OvlInode {
             return Err(SystemError::ENOENT);
         }
 
-        let file_type = if let Some(ref upper_inode) = upper_inode {
-            upper_inode.metadata()?.file_type
+        let file_type = if let Some(file_type) = upper_file_type {
+            file_type
         } else {
             lower_inodes[0].metadata()?.file_type
         };

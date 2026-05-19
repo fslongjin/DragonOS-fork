@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -84,6 +85,16 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
     return found;
 }
 
+static bool statfs_has_flag(const char *path, unsigned long flag) {
+    struct statfs st;
+
+    if (statfs(path, &st) != 0) {
+        return false;
+    }
+
+    return (static_cast<unsigned long>(st.f_flags) & flag) != 0;
+}
+
 }  // namespace
 
 TEST(MountReconfigure, BindRemountReadonly) {
@@ -147,6 +158,42 @@ TEST(MountReconfigure, BindRemountReadonly) {
 
     umount(target);
     cleanup_mount(source);
+}
+
+TEST(MountReconfigure, RemountPreservesAtimeModeWhenUnspecified) {
+    const char *target = "/tmp/test_mount_reconfigure_atime";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    if (mount("", target, "ramfs", 0, NULL) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    if (mount("", target, "ramfs", MS_REMOUNT | MS_NOATIME, NULL) != 0) {
+        cleanup_mount(target);
+        FAIL() << "set noatime on mount failed: " << strerror(errno);
+    }
+
+    ASSERT_TRUE(statfs_has_flag(target, MS_NOATIME));
+    ASSERT_FALSE(statfs_has_flag(target, MS_RELATIME));
+
+    if (mount("", target, "ramfs", MS_REMOUNT | MS_NODEV, NULL) != 0) {
+        cleanup_mount(target);
+        FAIL() << strerror(errno);
+    }
+
+    EXPECT_TRUE(statfs_has_flag(target, MS_NODEV));
+    EXPECT_TRUE(statfs_has_flag(target, MS_NOATIME));
+    EXPECT_FALSE(statfs_has_flag(target, MS_RELATIME));
+
+    cleanup_mount(target);
 }
 
 TEST(MountReconfigure, SelfBindSubdirRemountReadonly) {

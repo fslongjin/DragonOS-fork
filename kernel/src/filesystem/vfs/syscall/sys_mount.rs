@@ -231,7 +231,15 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::REMOUNT) {
-        return do_remount(target_inode, mnt_flags);
+        let preserve_atime = flags
+            .intersection(
+                MountFlags::NOATIME
+                    | MountFlags::NODIRATIME
+                    | MountFlags::RELATIME
+                    | MountFlags::STRICTATIME,
+            )
+            .is_empty();
+        return do_remount(target_inode, mnt_flags, preserve_atime);
     }
 
     if flags.contains(MountFlags::BIND) {
@@ -377,12 +385,21 @@ fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, Syst
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
-fn do_remount(target_inode: Arc<dyn IndexNode>, new_flags: MountFlags) -> Result<(), SystemError> {
+fn do_remount(
+    target_inode: Arc<dyn IndexNode>,
+    mut new_flags: MountFlags,
+    preserve_atime: bool,
+) -> Result<(), SystemError> {
     let fs = target_inode.fs();
     let mount_fs = fs
         .as_any_ref()
         .downcast_ref::<MountFS>()
         .ok_or(SystemError::EINVAL)?;
+    if preserve_atime {
+        let atime_flags = MountFlags::NOATIME | MountFlags::NODIRATIME | MountFlags::RELATIME;
+        new_flags.remove(atime_flags);
+        new_flags.insert(mount_fs.mount_flags() & atime_flags);
+    }
     mount_fs.set_mount_flags(new_flags);
     Ok(())
 }
