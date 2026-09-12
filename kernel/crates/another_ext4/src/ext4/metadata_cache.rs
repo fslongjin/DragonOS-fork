@@ -223,10 +223,21 @@ impl MetadataBlockCache {
         let MetadataCacheStorage::Enabled(sets) = &self.storage else {
             return None;
         };
-        // Fibonacci hashing prevents aligned ext4 metadata homes from mapping
-        // directly by their low bits. Modulo supports non-power-of-two sizes.
-        let mixed = home.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        sets.get((mixed % sets.len() as u64) as usize)
+        sets.get(Self::set_index(home, sets.len()))
+    }
+
+    fn set_index(home: PBlockId, set_count: usize) -> usize {
+        // The SplitMix64 finalizer avalanches high block-number bits before the
+        // modulo. Multiplication alone would only permute low bits for the
+        // common power-of-two set count, making equal offsets in ext4 block
+        // groups contend for the same four ways.
+        let mut mixed = home;
+        mixed ^= mixed >> 30;
+        mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed ^= mixed >> 27;
+        mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        (mixed % set_count as u64) as usize
     }
 
     fn allocate_ticket(&self) -> Option<u64> {
@@ -749,6 +760,25 @@ mod tests {
         assert!(retired.notify_progress);
         assert!(cache.read(device.as_ref(), 13).result.is_ok());
         assert_eq!(device.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn aligned_block_group_metadata_remains_resident() {
+        let cache = MetadataBlockCache::new(1024);
+        let device = TestDevice::plain();
+        let mut homes = [0u64; 8];
+        for (group, home) in homes.iter_mut().enumerate() {
+            // 32,768 blocks is a common 4 KiB ext4 blocks-per-group value and
+            // is divisible by all 256 sets in the production cache.
+            *home = 17 + group as u64 * 32_768;
+            cache.read(&device, *home).result.unwrap();
+        }
+        let populated_reads = device.reads.load(Ordering::SeqCst);
+        for home in homes {
+            cache.read(&device, home).result.unwrap();
+        }
+        assert_eq!(populated_reads, homes.len());
+        assert_eq!(device.reads.load(Ordering::SeqCst), populated_reads);
     }
 
     #[test]

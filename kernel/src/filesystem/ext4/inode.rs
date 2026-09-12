@@ -824,6 +824,65 @@ enum Ext4PreparedReadSegment {
     },
 }
 
+/// Reconciles the PageCache-visible EOF with ext4's durable inode EOF for one
+/// stable read window. Delayed allocation may place the visible EOF ahead of
+/// the durable EOF; the lower plan cannot expose that suffix, so absent cache
+/// pages and the durable EOF page tail are read as zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ext4ReadWindowCoverage {
+    durable_pages: usize,
+    durable_last_page_valid_bytes: usize,
+    visible_last_page_valid_bytes: usize,
+}
+
+impl Ext4ReadWindowCoverage {
+    fn new(
+        page_count: usize,
+        visible_valid_bytes: usize,
+        durable_valid_bytes: usize,
+    ) -> Result<Self, SystemError> {
+        let capacity = page_count
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if page_count == 0
+            || visible_valid_bytes == 0
+            || visible_valid_bytes > capacity
+            || durable_valid_bytes > visible_valid_bytes
+        {
+            return Err(SystemError::EIO);
+        }
+        Ok(Self {
+            durable_pages: durable_valid_bytes.div_ceil(MMArch::PAGE_SIZE),
+            durable_last_page_valid_bytes: Self::last_page_valid_bytes(durable_valid_bytes),
+            visible_last_page_valid_bytes: Self::last_page_valid_bytes(visible_valid_bytes),
+        })
+    }
+
+    fn last_page_valid_bytes(valid_bytes: usize) -> usize {
+        match valid_bytes % MMArch::PAGE_SIZE {
+            0 => MMArch::PAGE_SIZE,
+            tail => tail,
+        }
+    }
+
+    fn lower_segment_last_valid_bytes(&self, segment_end: usize) -> usize {
+        if segment_end == self.durable_pages {
+            self.durable_last_page_valid_bytes
+        } else {
+            MMArch::PAGE_SIZE
+        }
+    }
+
+    fn zero_extension(&self, page_count: usize) -> Option<(usize, usize, usize)> {
+        let count = page_count.checked_sub(self.durable_pages)?;
+        (count > 0).then_some((
+            self.durable_pages,
+            count,
+            self.visible_last_page_valid_bytes,
+        ))
+    }
+}
+
 struct Ext4ReadWorkerState {
     submitted: Vec<Ext4SubmittedReadSegment>,
     inode: Arc<LockedExt4Inode>,
@@ -1445,17 +1504,26 @@ impl PageCacheBackend for Ext4PageCacheBackend {
                     request.page_count.min(16) as u32,
                 )
             })?;
-            if plan.valid_bytes != request.valid_bytes {
-                return Err(SystemError::EIO);
-            }
+            let coverage = Ext4ReadWindowCoverage::new(
+                request.page_count,
+                request.valid_bytes,
+                plan.valid_bytes,
+            )?;
+            let zero_extension = coverage.zero_extension(request.page_count);
 
             // Finish every fallible allocation before the first BIO is
             // submitted. Once a device owns a request, no later ENOMEM may
             // drop its lifetime permit before retirement.
             let mut prepared = Vec::new();
+            let prepared_capacity = plan
+                .segments
+                .len()
+                .checked_add(usize::from(zero_extension.is_some()))
+                .ok_or(SystemError::EOVERFLOW)?;
             prepared
-                .try_reserve_exact(plan.segments.len())
+                .try_reserve_exact(prepared_capacity)
                 .map_err(|_| SystemError::ENOMEM)?;
+            let mut next_lower_slot = 0usize;
             for segment in plan.segments {
                 let logical_start = segment.logical_start() as usize;
                 let first_byte = logical_start
@@ -1464,19 +1532,17 @@ impl PageCacheBackend for Ext4PageCacheBackend {
                 let first_slot =
                     first_byte.checked_sub(offset).ok_or(SystemError::EIO)? / MMArch::PAGE_SIZE;
                 let page_count = segment.block_count() as usize;
+                if first_slot != next_lower_slot || page_count == 0 {
+                    return Err(SystemError::EIO);
+                }
                 let segment_end = first_slot
                     .checked_add(page_count)
                     .ok_or(SystemError::EOVERFLOW)?;
-                let last_valid = if segment_end == request.page_count {
-                    let tail = request.valid_bytes % MMArch::PAGE_SIZE;
-                    if tail == 0 {
-                        MMArch::PAGE_SIZE
-                    } else {
-                        tail
-                    }
-                } else {
-                    MMArch::PAGE_SIZE
-                };
+                if segment_end > coverage.durable_pages {
+                    return Err(SystemError::EIO);
+                }
+                next_lower_slot = segment_end;
+                let last_valid = coverage.lower_segment_last_valid_bytes(segment_end);
                 match segment {
                     another_ext4::ReadSegment::Zero { .. } => {
                         prepared.push(Ext4PreparedReadSegment::Zero {
@@ -1503,6 +1569,16 @@ impl PageCacheBackend for Ext4PageCacheBackend {
                         });
                     }
                 }
+            }
+            if next_lower_slot != coverage.durable_pages {
+                return Err(SystemError::EIO);
+            }
+            if let Some((first_slot, page_count, last_page_valid_bytes)) = zero_extension {
+                prepared.push(Ext4PreparedReadSegment::Zero {
+                    first_slot,
+                    page_count,
+                    last_page_valid_bytes,
+                });
             }
 
             let mut submitted = Vec::new();
@@ -5401,6 +5477,31 @@ impl Debug for Ext4Inode {
     }
 }
 
+fn run_read_window_coverage_selftest() -> bool {
+    let partial_same_page = Ext4ReadWindowCoverage::new(1, 513, 257);
+    let aligned_durable_eof =
+        Ext4ReadWindowCoverage::new(2, MMArch::PAGE_SIZE + 99, MMArch::PAGE_SIZE);
+    let delayed_extension =
+        Ext4ReadWindowCoverage::new(3, MMArch::PAGE_SIZE * 2 + 123, MMArch::PAGE_SIZE + 17);
+    let wholly_beyond_durable_eof = Ext4ReadWindowCoverage::new(1, 99, 0);
+
+    partial_same_page.is_ok_and(|coverage| {
+        coverage.durable_pages == 1
+            && coverage.lower_segment_last_valid_bytes(1) == 257
+            && coverage.zero_extension(1).is_none()
+    }) && aligned_durable_eof.is_ok_and(|coverage| {
+        coverage.durable_pages == 1
+            && coverage.lower_segment_last_valid_bytes(1) == MMArch::PAGE_SIZE
+            && coverage.zero_extension(2) == Some((1, 1, 99))
+    }) && delayed_extension.is_ok_and(|coverage| {
+        coverage.durable_pages == 2
+            && coverage.lower_segment_last_valid_bytes(2) == 17
+            && coverage.zero_extension(3) == Some((2, 1, 123))
+    }) && wholly_beyond_durable_eof
+        .is_ok_and(|coverage| coverage.zero_extension(1) == Some((0, 1, 99)))
+        && Ext4ReadWindowCoverage::new(1, 99, 100).is_err()
+}
+
 pub(crate) fn run_lifecycle_selftests() -> String {
     let mut failures = 0usize;
     let mut report = String::new();
@@ -5448,6 +5549,10 @@ pub(crate) fn run_lifecycle_selftests() -> String {
     append(
         "poison_is_observable",
         lifecycle.begin_operation().err() == Some(SystemError::EIO),
+    );
+    append(
+        "read_window_eof_coverage",
+        run_read_window_coverage_selftest(),
     );
 
     if failures == 0 {
