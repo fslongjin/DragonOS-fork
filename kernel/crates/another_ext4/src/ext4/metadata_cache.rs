@@ -457,6 +457,13 @@ impl MetadataBlockCache {
     where
         I: Iterator<Item = (PBlockId, PBlockId)> + Clone,
     {
+        // The common metadata transaction retires no physical block. Avoid
+        // taking every set lock and inspecting the complete cache in that
+        // path. Clone keeps the caller's iterator available for the bounded
+        // scan below without allocating in the infallible publication path.
+        if ranges.clone().next().is_none() {
+            return false;
+        }
         let MetadataCacheStorage::Enabled(sets) = &self.storage else {
             return false;
         };
@@ -541,8 +548,9 @@ impl MetadataBlockCache {
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc as StdArc, Barrier, Condvar, Mutex as StdMutex};
+    use std::sync::{mpsc, Arc as StdArc, Barrier, Condvar, Mutex as StdMutex};
     use std::thread;
+    use std::time::Duration;
 
     struct TestDevice {
         reads: AtomicUsize,
@@ -756,6 +764,26 @@ mod tests {
         cache.read(&device, 5).result.unwrap();
         cache.read(&device, 20).result.unwrap();
         assert_eq!(device.reads.load(Ordering::SeqCst) - before, 2);
+    }
+
+    #[test]
+    fn empty_retirement_does_not_take_any_set_lock() {
+        let cache = StdArc::new(MetadataBlockCache::new(WAYS));
+        let MetadataCacheStorage::Enabled(sets) = &cache.storage else {
+            panic!("test cache must be enabled");
+        };
+        let first_set = sets[0].lock();
+        let worker_cache = StdArc::clone(&cache);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let notify = worker_cache.invalidate_block_ranges(core::iter::empty());
+            sender.send(notify).unwrap();
+        });
+
+        let returned_without_lock = receiver.recv_timeout(Duration::from_millis(250));
+        drop(first_set);
+        worker.join().unwrap();
+        assert_eq!(returned_without_lock.unwrap(), false);
     }
 
     #[test]

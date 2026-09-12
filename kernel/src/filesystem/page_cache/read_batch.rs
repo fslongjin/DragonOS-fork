@@ -238,6 +238,13 @@ impl PageCacheReadBatchCompletion {
                 .account_state_transition(PageState::Loading, PageState::UpToDate);
             slot.entry.set_state(PageState::UpToDate);
             slot.entry.wait_queue.wake_all();
+        } else {
+            // The mapping may have been torn down after a reader captured this
+            // Loading entry. Identity validation must prevent stale data from
+            // being republished, but the detached entry still owns its wait
+            // protocol and therefore needs an observable terminal state.
+            slot.entry.set_state(PageState::Error);
+            slot.entry.wait_queue.wake_all();
         }
         drop(inner);
         self.finish_one();
