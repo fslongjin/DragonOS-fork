@@ -72,6 +72,26 @@ fn run_writeback_domain_lifecycle_selftest() -> bool {
         && active.wait_drained().is_ok()
 }
 
+fn run_detached_read_batch_completion_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_unowned(None, None);
+    let completion = PageCacheReadBatchCompletion::reserve(&cache, 0, 1, None)?;
+    let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+    let page = cache.manager.remove_page(0)?.ok_or(SystemError::EIO)?;
+
+    let payload = [0u8; MMArch::PAGE_SIZE];
+    completion.complete_data(0, 1, &payload, MMArch::PAGE_SIZE)?;
+    let completed = entry.state() == PageState::Error && completion.unfinished() == 0;
+
+    drop(completion);
+    drop(entry);
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+    drop(page);
+    drop(cache);
+    Ok(completed)
+}
+
 #[inline(never)]
 fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
     use crate::{
@@ -1907,6 +1927,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_writeback_domain_lifecycle_selftest() {
         return Ok("status=fail stage=writeback_domain_lifecycle\n".into());
+    }
+
+    if !run_detached_read_batch_completion_selftest()? {
+        return Ok("status=fail stage=detached_read_batch_completion\n".into());
     }
 
     if !run_preallocated_batch_lifecycle_selftest()? {
@@ -3768,6 +3792,6 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(alloc::format!(
-        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nramfs_fallocate_range=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }
