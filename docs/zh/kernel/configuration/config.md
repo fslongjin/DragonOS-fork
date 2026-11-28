@@ -1,105 +1,71 @@
 # 内核编译配置说明
 
-## 原理
+DragonOS 的内核编译配置基于 **Cargo Features** 与 **Makefile / `env.mk` 环境变量** 共同管理，不再使用早期的 `kernel.config` / `d.config` 机制。
 
-在内核目录下，用kernel.config来设置内核编译配置信息，以类似解析toml文件的方式去解析该文件，然后接着去解析各模块下的d.config以获取feature的启用情况
+## Cargo Features 配置
 
-## 示例
+内核的编译期功能开关定义在 `kernel/Cargo.toml` 的 `[features]` 段中。
 
-**kernel.config**
+### 默认启用的 Features
 
-```toml
-[[module.include]]
-name = "init"
-path = "src/init/"
-enable = "y"
-description = ""
+| Feature | 说明 |
+| --- | --- |
+| `fatfs` | 启用 FAT 文件系统支持 |
+| `fatfs-secure` | 启用 FAT 安全相关选项（依赖 `fatfs`） |
+| `kvm` | 启用基础 KVM 虚拟化支持 |
+| `kstack_protect` | 启用内核栈保护以辅助检测栈溢出（会使内核栈内存占用翻倍） |
+| `static_keys_test` | 启用 static keys 测试支持 |
 
-[[module.include]]
-name = "mm"
-path = "src/mm/"
-enable = "y"
-description = ""
-```
+### 可选功能与测试 Features
 
+以下 Feature 默认关闭，可根据需要按需开启：
 
-- **[[module.include]]:** 将模块加入到include列表中
-- **name:** 模块名
-- **path:** 模块路径，存放着d.config
-- **enable:**
-  - **y:** 启用，解析模块下的d.config
-  - **n:** 不启用，不解析
-- **description:** 模块的描述信息
+| Feature | 类别 | 说明 |
+| --- | --- | --- |
+| `initram` | 可选功能 | 启用 initramfs 支持（配合 `INITRAM_PATH` 使用） |
+| `driver_ps2_mouse` | 可选功能 | 启用 PS/2 鼠标驱动 |
+| `mm_selftest` | 内核自测 | 内存管理与 DMA 压测及受控故障注入自测 |
+| `sched_selftest` | 内核自测 | 调度器组调度与 CPU 亲和性回归自测 |
+| `cred_selftest` | 内核自测 | 进程凭证（cred）作用域回归自测 |
+| `kprobe_test` | 内核自测 | kprobe 功能测试 |
+| `fifo_demo` | 调试演示 | 每 CPU FIFO 实时调度队列烟雾测试 |
 
+### 如何启用或修改 Features
 
-**src/mm/d.config**
+- **构建时临时追加（推荐）**：通过 `KERNEL_FEATURES` 环境变量传入（多个 Feature 用逗号分隔），构建脚本会将其透传给 `cargo build --features`：
 
-```toml
-[module]
-name = "mm"
-description = ""
+  ```bash
+  # 开启单个自测 feature
+  make kernel KERNEL_FEATURES=mm_selftest
 
-[[module.include]]
-name = "allocator"
-path = "src/mm/allocator/"
-enable = "y"
-description = ""
+  # 同时开启多个 feature
+  make kernel KERNEL_FEATURES="mm_selftest,sched_selftest"
+  ```
 
-[[module.features]]
-name = "mm_debug"
-enable = "y"
-description = ""
-```
+- **调整默认 Features**：如需长期开启或关闭某个默认 Feature（例如调整 `kstack_protect`），可直接修改 `kernel/Cargo.toml` 中的 `default` 列表。
 
+## 常用构建环境变量
 
-- **\[module\]:** 当前模块
-  - **name:** 当前模块名称
-  - **description:** 模块的描述信息
-- **[[module.include]]:** 当前模块下所包含的模块，与kernel.config下的相同
-- **[[module.features]]:** 当前模块下的feature
-  - **name:** feature名
-  - **enable:** 是否开启
-    - **y:** 开启
-    - **n:** 不开启
-  - **description:** feature的描述信息
+除 Cargo Features 外，还可通过命令行参数或修改根目录 `env.mk` 调整构建行为：
 
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ARCH` | `x86_64` | 目标架构，支持 `x86_64`、`riscv64`、`loongarch64`（详见 [目标架构配置](/zh/kernel/configuration/arch.html)） |
+| `KERNEL_FEATURES` | 空 | 追加启用的内核 Cargo features，逗号分隔 |
+| `ROOTFS_MANIFEST` | `ubuntu2404`（`x86_64`）<br>`default`（其他架构） | RootFS 清单名称，对应 `config/rootfs-manifests/` 下的配置 |
+| `UNWIND_ENABLE` | `yes`（`loongarch64` 为 `no`） | 是否启用内核栈展开（`.eh_frame` 与 `panic=unwind`） |
+| `INITRAM_PATH` | `$(ROOT_PATH)/x86.cpio.xz` | initramfs 镜像路径，配合 `initram` feature 使用 |
+| `SKIP_GRUB` | `0`（CI 环境为 `1`） | 设为 `1` 时跳过 GRUB 自动安装，适用于 CI 或纯串口/nographic 场景 |
 
-*以下是其它模块下的d.config：*
+### 常见用法示例
 
-**src/mm/allocator/d.config**
+```bash
+# 使用默认配置编译内核
+make kernel
 
-```toml
-[module]
-name = "allocator"
-description = ""
+# 关闭内核栈展开编译
+make kernel UNWIND_ENABLE=no
 
-[[module.features]]
-name = "allocator_debug"
-enable = "y"
-description = ""
-```
-
-**src/init/d.config**
-
-```toml
-[module]
-name = "init"
-description = ""
-
-[[module.features]]
-name = "init_debug"
-enable = "y"
-description = ""
-```
-
-
-上面所有已开启模块的d.config中的feature，会最终生成到内核目录下的D.config文件，即D.config是最终内核编译的配置，如下：
-
-
-**D.config**
-
-```
-init_debug = y
-allocator_debug = y
-mm_debug = y
+# 指定目标架构与额外 feature 编译
+make kernel ARCH=riscv64 KERNEL_FEATURES=kprobe_test
 ```

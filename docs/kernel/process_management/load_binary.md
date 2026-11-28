@@ -1,16 +1,16 @@
-# Loader
+# Binary Loader
 
-## 1. Binary Program Loading
+## 1. Binary & Script Loading Flow
 
-In this section, you will learn about the principles of the binary loader in DragonOS.
+This section summarizes how `execve` loads binaries and scripts in DragonOS (implemented in `kernel/src/process/exec.rs`, `kernel/src/process/shebang.rs`, and `kernel/src/libs/elf.rs`).
 
-When DragonOS loads a binary program, it performs a "probe-load" process.
+DragonOS follows a **"probe-and-load"** pipeline when executing a program:
 
-During the probe phase, DragonOS reads the file header and sequentially calls the probe functions of each binary loader to determine whether the binary program is suitable for that loader. If it is suitable, the loader will be used to load the program.
+1. **Shebang Probing**: First checks whether the file starts with `#!`. For scripts, the shebang loader parses the interpreter path and optional argument, then re-invokes loading for the target interpreter (bounded by `SHEBANG_MAX_RECURSION_DEPTH`).
+2. **Binary Format Probing**: Reads the file header and invokes `probe` on registered `BinaryLoader` implementations to identify a matching loader.
+3. **Loading & Mapping**: Maps program segments into the new user address space, sets up the user stack, arguments (`argv`), environment variables (`envp`), and auxiliary vector (`auxv`), and returns the entry point address.
 
-During the load phase, DragonOS uses the aforementioned loader to load the program. The loader will map the various segments of the binary program into memory and obtain the entry address of the binary program.
+## 2. Supported Formats & Linking Modes
 
-::: info
-Currently, DragonOS does not support dynamic linking, so all binary programs are statically linked. And only the ELF loader is temporarily supported.
-:::
-
+- **ELF Loader (`ELF_LOADER`)**: Supports standard 64-bit ELF executables, including both **statically linked** and **dynamically linked** binaries (handling `PT_INTERP` to load dynamic linkers such as `glibc` / `musl` `ld.so` and populating `AT_PHDR`, `AT_ENTRY`, `AT_BASE`, etc. in `auxv`), as well as PIE executables.
+- **Shebang Loader (`SHEBANG_LOADER`)**: Supports script executables such as `#!/bin/sh` and `#!/usr/bin/env python3`.

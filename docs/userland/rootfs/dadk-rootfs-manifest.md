@@ -1,33 +1,32 @@
-# DADK RootFS Manifest Configuration (Non-Nix) {#_dadk_rootfs_manifest}
+# RootFS Manifest Configuration (Docker Image / DADK) {#_dadk_rootfs_manifest}
 
-This document explains the current RootFS configuration method for DragonOS based on DADK (corresponding to the traditional pipeline of `make run` / `make write_diskimage`), and aligns with the latest implementation in the repository.
+This document describes DragonOS's RootFS Manifest configuration workflow (used by `make run` / `make write_diskimage`), which builds a DragonOS RootFS directly from official or locally built Docker images.
 
 ::: info
-If you are using the Nix RootFS build pipeline, please refer to `diskgen.md` in the same directory.
+If you use the Nix RootFS pipeline (`nix run .#rootfs-*`), see [From Software Packages to RootFS Image (Nix)](/userland/rootfs/diskgen.html).
 :::
 
+## 1. Unified Entry Point & Built-in Manifests
 
-## 1. Single RootFS Manifest Entry
+All RootFS manifests live under `config/rootfs-manifests/<name>.toml`. The repository currently ships with:
 
-The current single entry file is:
+| Manifest | Path | Base Image | FS / Size | Use Case |
+| --- | --- | --- | --- | --- |
+| `ubuntu2404` | `config/rootfs-manifests/ubuntu2404.toml` | `ubuntu:24.04` | `ext4` / `2G` | **Default on `x86_64`**; supports installing packages directly via `apt` |
+| `docker` | `config/rootfs-manifests/docker.toml` | `dragonos-docker:ubuntu2404-29.1.3` | `ext4` / `4G` | Full environment for running Docker inside DragonOS (built from `tools/docker-rootfs/Dockerfile`) |
+| `default` | `config/rootfs-manifests/default.toml` | None (empty) | `fat32` / `2G` | Default on non-`x86_64` architectures; minimal userspace from `sets/default` |
 
-- `config/rootfs-manifests/``<name>``.toml`
-
-Examples:
-
-- `config/rootfs-manifests/default.toml`
-- `config/rootfs-manifests/ubuntu2404.toml`
-
-Selection via environment variable:
+Select a manifest via the `ROOTFS_MANIFEST` environment variable:
 
 ```bash
-ROOTFS_MANIFEST=default make run-nographic
 ROOTFS_MANIFEST=ubuntu2404 make run-nographic
+ROOTFS_MANIFEST=docker make run-nographic
+ROOTFS_MANIFEST=default make run-nographic
 ```
 
-Defaults to `default` if not specified.
+When omitted, `env.mk` defaults to `ubuntu2404` on `x86_64` and `default` on other architectures.
 
-## 2. Manifest Field Descriptions
+## 2. Manifest Fields
 
 Example (`config/rootfs-manifests/ubuntu2404.toml`):
 
@@ -49,75 +48,108 @@ pull_policy = "if-not-present"
 config_dir = "user/dadk/config/sets/ubuntu2404"
 ```
 
-Field semantics:
+Field reference:
 
-- `metadata.arch`: Must match the current `ARCH` (will error before build if inconsistent).
-- `rootfs.fs_type`: Such as `fat32` / `ext4`.
-- `rootfs.size`: Disk image size (e.g., `2G`).
-- `rootfs.partition`: Partition scheme (currently commonly `mbr`).
-- `base.image`: Docker base image; empty string means no base.
-- `base.pull_policy`: Image pull policy.
-- `user.config_dir`: User program configuration directory corresponding to the current manifest.
+- **`[metadata]`**
+  - `name`: Manifest name.
+  - `arch`: Target architecture (e.g., `x86_64`). Must match the current `ARCH` environment variable or the build will fail; `"*"` follows the current `ARCH`.
+- **`[rootfs]`**
+  - `fs_type`: Root filesystem type, typically `ext4` or `fat32`.
+  - `size`: Disk image size (e.g., `2G`, `4G`). Increase this if your custom image is larger.
+  - `partition`: Partition scheme, currently `mbr`.
+- **`[base]`**
+  - `image`: Docker image used as the RootFS base layer (remote or locally built via `docker build`); an empty string `""` means no base image.
+  - `pull_policy`: Image pull policy, defaulting to `if-not-present` (uses the local image when already present).
+- **`[user]`**
+  - `config_dir`: DADK userspace package config directory overlaid on top of the base image (e.g., `user/dadk/config/sets/ubuntu2404`).
 
-## 3. Package Configuration Directory Conventions
+## 3. Adding Custom Files & Apps with a Local Docker Image
 
-Current directory structure:
+The most straightforward way to include your own binaries, libraries, or arbitrary files in DragonOS is to build a local Docker image and reference it in a manifest:
 
-- `user/dadk/config/all/`: Stores all application `.toml`.
-- `user/dadk/config/sets/``<set-name>``/`: Organizes package collections by scenario, typically referencing `../../all/*.toml` via soft links.
+1. **Write a `Dockerfile` and build locally**
 
-For example:
+   ```dockerfile
+   FROM ubuntu:24.04
 
-- `user/dadk/config/sets/default/`
-- `user/dadk/config/sets/ubuntu2404/`
+   RUN apt-get update && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       && rm -rf /var/lib/apt/lists/*
 
-Switch the installed package collection by changing `user.config_dir` in the manifest.
+   COPY ./my-app /usr/local/bin/my-app
+   COPY ./my-config.yaml /etc/my-app/config.yaml
+   ```
 
-## 4. Parsing and Generated Files
+   ```bash
+   docker build -t my-dragonos-rootfs:latest .
+   ```
 
-Automatically called before build:
+2. **Create or edit a manifest**
 
-- `tools/rootfs_manifest_resolve.sh`
+   Copy `config/rootfs-manifests/ubuntu2404.toml` to `config/rootfs-manifests/custom.toml`, then update `name`, `[base].image` (and `rootfs.size` if needed):
 
-Generates two files:
+   ```toml
+   [metadata]
+   name = "custom"
+   arch = "x86_64"
+
+   [rootfs]
+   fs_type = "ext4"
+   size = "4G"
+   partition = "mbr"
+
+   [base]
+   image = "my-dragonos-rootfs:latest"
+   pull_policy = "if-not-present"
+
+   [user]
+   config_dir = "user/dadk/config/sets/ubuntu2404"
+   ```
+
+3. **Write the disk image or boot**
+
+   ```bash
+   # Regenerate disk image only
+   ROOTFS_MANIFEST=custom SKIP_GRUB=1 make write_diskimage
+
+   # Build and boot DragonOS
+   ROOTFS_MANIFEST=custom make run-nographic
+   ```
+
+## 4. DADK Package Set Directory Layout
+
+In addition to the Docker base image, repository-maintained utilities and tests are overlaid by DADK:
+
+- `user/dadk/config/all/`: All application `.toml` definitions.
+- `user/dadk/config/sets/<set-name>/`: Scenario-specific package sets (symlinks to `../../all/*.toml`), such as `sets/default/` and `sets/ubuntu2404/`.
+
+Switch package sets by changing `user.config_dir` in the manifest.
+
+## 5. Resolution & Automatic Reinstall
+
+Before building, `tools/rootfs_manifest_resolve.sh` automatically generates:
 
 - `config/rootfs.generated.toml`
 - `dadk-manifest.generated.toml`
 
-Subsequent DADK commands uniformly execute based on `dadk-manifest.generated.toml`.
-
-You can also manually perform a check:
+You can also validate resolution manually:
 
 ```bash
 ROOTFS_MANIFEST=ubuntu2404 ARCH=x86_64 make prepare_rootfs_manifest
 ```
 
-## 5. Common Commands
+`user/Makefile` tracks manifest hashes automatically: switching `ROOTFS_MANIFEST` or editing a manifest cleans stale DADK output caches and rebuilds `bin/sysroot`, so manual cleanup is usually unnecessary.
 
-### 5.1 Full Build and Launch
+## 6. Common Commands
 
 ```bash
-ROOTFS_MANIFEST=default make run
+# Full build and boot (graphical / serial console)
+ROOTFS_MANIFEST=ubuntu2404 make run
 ROOTFS_MANIFEST=ubuntu2404 make run-nographic
-```
 
-### 5.2 Write Disk Image Only
-
-```bash
+# Build disk image only (skip GRUB installation)
 ROOTFS_MANIFEST=ubuntu2404 SKIP_GRUB=1 make write_diskimage
-```
 
-### 5.3 Build User Space Only and Install to `bin/sysroot`
-
-```bash
+# Build and install userspace into bin/sysroot only
 ROOTFS_MANIFEST=ubuntu2404 make user
 ```
-
-## 6. Reinstallation Behavior After Manifest Changes
-
-`user/Makefile` has implemented the following protection logic:
-
-- When the manifest changes, it cleans the DADK output cache and reinstalls user programs.
-- When the manifest tags are inconsistent, it deletes and recreates `bin/sysroot`, preventing old results from polluting new configurations.
-
-Therefore, it is usually unnecessary to manually delete `sysroot`; simply re-execute the build command with the new `ROOTFS_MANIFEST`.

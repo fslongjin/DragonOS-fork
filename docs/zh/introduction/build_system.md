@@ -1,5 +1,11 @@
 # 构建DragonOS {#_build_dragonos}
 
+::: tip 选择合适的构建与体验方式
+- **本地开发（推荐）**：使用下文的一键初始化脚本 `tools/bootstrap.sh` 配合 `make run` / `make run-nographic`（支持完整的 Docker RootFS Manifest 定制）。
+- **云端零配置体验**：使用 [DragonOS Playground](https://cnb.cool/DragonOS-Community/playground) 一键体验最新 nightly build。
+- **可选隔离环境**：也可使用 [Nix 开发环境](/zh/introduction/develop_nix.html) 或 [VS Code Devcontainer](/zh/introduction/devcontainer.html)。
+:::
+
 ## 0.快速体验
 
 如果您只是想快速体验DragonOS，而不需要进行本地开发，我们强烈推荐您使用 **DragonOS Playground** 进行云原生开发。这种方式**零配置、一键启动**，无需安装任何本地依赖，即可在云端体验DragonOS的最新nightly build版本。

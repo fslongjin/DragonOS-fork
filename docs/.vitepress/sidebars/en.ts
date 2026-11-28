@@ -4,6 +4,7 @@ export const enSidebar = [
       collapsed: false,
       items: [
       { text: 'Introduction to DragonOS', link: '/introduction/' },
+      { text: 'Features', link: '/introduction/features' },
       { text: 'Building DragonOS', link: '/introduction/build_system' },
       { text: 'Developing DragonOS with Nix', link: '/introduction/develop_nix' },
       { text: 'Developing DragonOS with devcontainer', link: '/introduction/devcontainer' },
@@ -17,7 +18,6 @@ export const enSidebar = [
       {
         text: 'Kernel Compilation Configuration',
         collapsed: true,
-        link: '/kernel/configuration/',
         items: [
         { text: 'Kernel Compilation Configuration Guide', link: '/kernel/configuration/config' },
         { text: 'Target Architecture Configuration', link: '/kernel/configuration/arch' }
@@ -26,7 +26,6 @@ export const enSidebar = [
       {
         text: 'Bootloader',
         collapsed: true,
-        link: '/kernel/boot/',
         items: [
         { text: 'Bootloader', link: '/kernel/boot/bootloader' },
         { text: 'Kernel Boot Command Line Parameters', link: '/kernel/boot/cmdline' }
@@ -35,19 +34,17 @@ export const enSidebar = [
       {
         text: 'Core API Documentation',
         collapsed: true,
-        link: '/kernel/core_api/',
         items: [
         { text: 'DragonOS Kernel Core API', link: '/kernel/core_api/kernel_api' },
         { text: 'Atomic Variables', link: '/kernel/core_api/atomic' },
         { text: 'Type Conversion Library API', link: '/kernel/core_api/casting' },
-        { text: 'Notifier Chain Notification Chain', link: '/kernel/core_api/notifier_chain' },
+        { text: 'Notifier Chain', link: '/kernel/core_api/notifier_chain' },
         { text: 'Soft Interrupt', link: '/kernel/core_api/softirq' }
         ]
       },
       {
         text: 'Interrupts and Bottom Halves',
         collapsed: true,
-        link: '/kernel/interrupt/',
         items: [
         { text: 'tasklet', link: '/kernel/interrupt/tasklet' },
         { text: 'DragonOS Workqueue Mechanism Design Document', link: '/kernel/interrupt/workqueue' }
@@ -56,7 +53,6 @@ export const enSidebar = [
       {
         text: 'Locks',
         collapsed: true,
-        link: '/kernel/locking/',
         items: [
         { text: 'Types of Locks and Their Rules', link: '/kernel/locking/locks' },
         { text: 'Spinlock', link: '/kernel/locking/spinlock' },
@@ -68,7 +64,6 @@ export const enSidebar = [
       {
         text: 'RCU',
         collapsed: true,
-        link: '/kernel/rcu/',
         items: [
         { text: 'DragonOS RCU Architecture', link: '/kernel/rcu/architecture' },
         { text: 'RCU Segmented Callback Queues', link: '/kernel/rcu/segmented-callback-queues' },
@@ -78,17 +73,15 @@ export const enSidebar = [
       {
         text: 'Process Management Module',
         collapsed: true,
-        link: '/kernel/process_management/',
         items: [
         { text: 'kthread Kernel Threads', link: '/kernel/process_management/kthread' },
-        { text: 'Loader', link: '/kernel/process_management/load_binary' },
+        { text: 'Binary Loader', link: '/kernel/process_management/load_binary' },
         { text: 'Principle of DragonOS Multi-threaded Exec (De-thread) Mechanism', link: '/kernel/process_management/de_thread' }
         ]
       },
       {
         text: 'DragonOS Scheduling',
         collapsed: true,
-        link: '/kernel/sched/',
         items: [
         { text: 'APIs Related to Process Scheduler', link: '/kernel/sched/core' },
         { text: 'APIs Related to the Completely Fair Scheduler', link: '/kernel/sched/cfs' },
@@ -101,7 +94,6 @@ export const enSidebar = [
       {
         text: 'Interprocess Communication',
         collapsed: true,
-        link: '/kernel/ipc/',
         items: [
         { text: 'Signal', link: '/kernel/ipc/signal' },
         { text: 'IPC Namespace', link: '/kernel/ipc/ipc_namespace' },
@@ -111,7 +103,6 @@ export const enSidebar = [
       {
         text: 'Memory Management',
         collapsed: true,
-        link: '/kernel/memory_management/',
         items: [
         { text: 'Introduction to the Memory Management Module', link: '/kernel/memory_management/intro' },
         { text: 'Memory Allocation Guide', link: '/kernel/memory_management/allocate-memory' },
@@ -123,7 +114,6 @@ export const enSidebar = [
       {
         text: 'File System',
         collapsed: true,
-        link: '/kernel/filesystem/',
         items: [
         { text: 'Overview', link: '/kernel/filesystem/overview' },
         { text: 'DragonOS inotify: User Semantics and Architecture', link: '/kernel/filesystem/inotify' },
@@ -132,18 +122,15 @@ export const enSidebar = [
         {
           text: 'VFS Virtual File System',
           collapsed: true,
-          link: '/kernel/filesystem/vfs/',
           items: [
           { text: 'Design', link: '/kernel/filesystem/vfs/design' },
           { text: 'Mount Propagation Mechanism', link: '/kernel/filesystem/vfs/mount_propagation' },
-          { text: 'VFS API Documentation', link: '/kernel/filesystem/vfs/api' },
           { text: 'Mountable Filesystem', link: '/kernel/filesystem/vfs/mountable_fs' }
           ]
         },
         {
           text: 'ProcFS',
           collapsed: true,
-          link: '/kernel/filesystem/proc/',
           items: [
           { text: 'Proc Mount Export Interface', link: '/kernel/filesystem/proc/mounts' }
           ]
@@ -153,7 +140,6 @@ export const enSidebar = [
         {
           text: 'Union Filesystem',
           collapsed: true,
-          link: '/kernel/filesystem/unionfs/',
           items: [
           { text: 'overlayfs', link: '/kernel/filesystem/unionfs/overlayfs' }
           ]
@@ -163,7 +149,6 @@ export const enSidebar = [
       {
         text: 'Kernel Debug Module',
         collapsed: true,
-        link: '/kernel/debug/',
         items: [
         { text: 'Kernel Stack Traceback', link: '/kernel/debug/traceback' },
         { text: 'How to Use GDB to Debug the Kernel', link: '/kernel/debug/debug-kernel-with-gdb' },
@@ -173,7 +158,6 @@ export const enSidebar = [
       {
         text: 'Kernel Testing',
         collapsed: true,
-        link: '/kernel/ktest/',
         items: [
         { text: 'dunitest Userspace Test Framework', link: '/kernel/ktest/dunitest' },
         { text: 'gVisor System Call Testing', link: '/kernel/ktest/gvisor_syscall_test' }
@@ -182,12 +166,10 @@ export const enSidebar = [
       {
         text: 'Processor Architecture',
         collapsed: true,
-        link: '/kernel/cpu_arch/',
         items: [
         {
           text: 'x86-64 Related Documentation',
           collapsed: true,
-          link: '/kernel/cpu_arch/x86_64/',
           items: [
           { text: 'USB Legacy Support', link: '/kernel/cpu_arch/x86_64/usb_legacy_support' }
           ]
@@ -195,20 +177,9 @@ export const enSidebar = [
         ]
       },
       {
-        text: 'Containerization',
-        collapsed: true,
-        link: '/kernel/container/',
-        items: [
-        { text: 'Union Filesystem', link: '/kernel/filesystem/unionfs/' }
-        ]
-      },
-      {
         text: 'Other Kernel Libraries',
         collapsed: true,
-        link: '/kernel/libs/',
         items: [
-        { text: 'Screen Manager (SCM)', link: '/kernel/libs/lib_ui/scm' },
-        { text: 'Text UI Framework (textui)', link: '/kernel/libs/lib_ui/textui' },
         { text: 'unified-init Unified Initialization Library', link: '/kernel/libs/unified-init' },
         { text: 'ID Allocation', link: '/kernel/libs/id-allocation' }
         ]
@@ -216,7 +187,6 @@ export const enSidebar = [
       {
         text: 'Network Subsystem',
         collapsed: true,
-        link: '/kernel/net/',
         items: [
         { text: 'Internet Protocol Socket', link: '/kernel/net/inet' },
         { text: 'UNIX', link: '/kernel/net/unix' },
@@ -227,7 +197,6 @@ export const enSidebar = [
       {
         text: 'Kernel Tracing Mechanism',
         collapsed: true,
-        link: '/kernel/trace/',
         items: [
         { text: 'Tracepoints', link: '/kernel/trace/tracepoint' },
         { text: 'DragonOS Runtime Text Patching: Principles, Usage, and Safety Boundaries', link: '/kernel/trace/text_patching' },
@@ -239,7 +208,6 @@ export const enSidebar = [
       {
         text: 'System Calls',
         collapsed: true,
-        link: '/kernel/syscall/',
         items: [
         { text: 'System Call Table Implementation Plan', link: '/kernel/syscall/syscall_table' },
         { text: 'Design Documentation for sys_capget / sys_capset', link: '/kernel/syscall/sys_capget_capset' }
@@ -248,7 +216,6 @@ export const enSidebar = [
       {
         text: 'Device',
         collapsed: true,
-        link: '/kernel/device/',
         items: [
         { text: 'Linux tty Devices', link: '/kernel/device/tty' },
         { text: 'Loop Device Architecture Design', link: '/kernel/device/loop_device' }
@@ -261,24 +228,17 @@ export const enSidebar = [
       collapsed: false,
       items: [
       {
-        text: 'User-space Build Documentation (DADK)',
-        collapsed: true,
-        link: '/userland/appdev/',
-        items: [
-        { text: 'Quick Start Guide for Rust Application Development', link: '/userland/appdev/rust-quick-start' },
-        { text: 'Developing C/C++ Applications for DragonOS', link: '/userland/appdev/c-cpp-quick-start' },
-        { text: 'Quickly package an app with DADK', link: 'https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html' },
-        { text: 'Complete DADK documentation', link: 'https://docs.dragonos.org.cn/p/dadk/' }
-        ]
+        text: 'Application Development & Deployment',
+        link: '/userland/appdev/'
       },
       {
-        text: 'User-space Build Documentation (Nix)',
+        text: 'RootFS Build & Configuration',
         collapsed: true,
         link: '/userland/rootfs/',
         items: [
-        { text: 'DADK RootFS Manifest Configuration (Non-Nix)', link: '/userland/rootfs/dadk-rootfs-manifest' },
-        { text: 'From Software Packages to RootFS Image', link: '/userland/rootfs/diskgen' },
-        { text: 'Add Programs / Add Custom Programs!', link: '/userland/rootfs/add-your-own-app' }
+        { text: 'RootFS Manifest Configuration (Docker Image / DADK)', link: '/userland/rootfs/dadk-rootfs-manifest' },
+        { text: 'From Packages to RootFS Image (Nix)', link: '/userland/rootfs/diskgen' },
+        { text: 'Adding Built-in Programs in Nix', link: '/userland/rootfs/add-your-own-app' }
         ]
       }
       ]
@@ -296,11 +256,10 @@ export const enSidebar = [
       collapsed: false,
       items: [
       {
-        text: 'Frequently Asked Questions',
+        text: 'FAQ',
         collapsed: true,
-        link: '/questions/',
         items: [
-        { text: 'Common Issues During Build', link: '/questions/build_errors' }
+        { text: 'Common Build Issues', link: '/questions/build_errors' }
         ]
       }
       ]
@@ -310,21 +269,19 @@ export const enSidebar = [
       collapsed: false,
       items: [
       {
-        text: 'Contributing to Development',
+        text: 'Contribute',
         collapsed: true,
-        link: '/community/code_contribution/',
         items: [
-        { text: 'How to contribute', link: 'https://community.dragonos.org/contributors/' },
-        { text: 'C Language Code Style', link: '/community/code_contribution/c-coding-style' },
-        { text: 'Rust Language Code Style', link: '/community/code_contribution/rust-coding-style' },
-        { text: 'Code Commit Guidelines', link: '/community/code_contribution/conventional-commit' }
+        { text: 'How to Contribute', link: 'https://community.dragonos.org/contributors/' },
+        { text: 'Rust Coding Style', link: '/community/code_contribution/rust-coding-style' },
+        { text: 'C Coding Style', link: '/community/code_contribution/c-coding-style' },
+        { text: 'Conventional Commit Guidelines', link: '/community/code_contribution/conventional-commit' }
         ]
       },
-      { text: 'Get in Touch with the Community', link: '/community/contact/' },
+      { text: 'Contact the Community', link: '/community/contact/' },
       {
-        text: 'Release Notes',
+        text: 'Changelog',
         collapsed: true,
-        link: '/community/ChangeLog/',
         items: [
         { text: 'V0.4.0', link: '/community/ChangeLog/V0.4.x/V0.4.0' },
         { text: 'V0.3.0', link: '/community/ChangeLog/V0.3.x/V0.3.0' },

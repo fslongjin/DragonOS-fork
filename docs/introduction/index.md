@@ -1,15 +1,22 @@
 # Introduction to DragonOS
 
-DragonOS, the Dragon Operating System, is a 64-bit operating system designed for lightweight cloud computing scenarios. It features a fully self-developed kernel and provides Linux binary compatibility. Developed using the Rust programming language, it offers enhanced reliability. Currently, DragonOS ranks among the top three in the Rust operating system field on GitHub.
+DragonOS is a lightweight 64-bit operating system with an independent kernel built from scratch in Rust for the **Agent Native** era, providing **Linux binary (ABI) compatibility**. It is designed to run **AI Agent sandboxes** and **cloud-native services** efficiently and securely.
 
-The DragonOS open-source community was established in July 2022. It is completely neutral in commercial matters. Our goal is to build a fully independent, open-source, high-performance, and highly reliable server operating system, **to create a fully self-controlled digital future!**
+## Why Agent Native?
 
-DragonOS has an excellent and well-designed architecture. Compared to other systems of similar size, DragonOS supports virtualization and has certain advantages in areas such as device model and scheduling subsystems. Currently, we are actively promoting cloud platform support, RISC-V support, as well as the porting of compilers and application software. We aim to achieve large-scale application in production environments within five years.
+As AI Agents increasingly execute code, invoke external tools, and orchestrate complex workflows, the underlying operating system faces new infrastructure requirements:
 
-DragonOS is currently developing rapidly under the drive of the community. At present, DragonOS has already implemented about 1/4 of the Linux interface. In the future, we will provide 100% compatibility with Linux and introduce new features.
+- **High-Density, Lightweight Agent Sandboxes**: Agent runtimes frequently spin up and tear down isolated environments, demanding fast boot times, low memory overhead, and a minimal attack surface. As a lightweight **Guest OS**, DragonOS sheds the legacy baggage of traditional general-purpose kernels. Leveraging Rust's memory safety and a streamlined kernel architecture—alongside mechanisms such as Namespaces and Cgroups—it provides efficient, reliable process isolation and resource control inside sandboxes, making it well-suited for large-scale, high-density Agent execution.
+- **Rich Language Runtimes and Mainstream Service Ecosystem**: Agent code execution, tool services, data storage, and long-running backend services rely heavily on the mature Linux ecosystem. Committed to Linux binary compatibility while continuously advancing container support, networking, scheduling, and eBPF, DragonOS supports mainstream programming languages and runtimes (such as C/C++, Go, Python, and Rust), and enables widely used server software like MySQL and ClickHouse to run directly on DragonOS without modification.
 
-The goal of DragonOS is to build a fully independent, open-source, high-performance, and highly reliable server operating system, providing a completely self-controlled core power for the country's digital infrastructure construction.
+## Technical Highlights & Evolution
 
-As a community-driven open-source operating system, in order to promote the development of the open-source community and avoid potential infringement by commercial companies that do not comply with open-source agreements, we have decided to open the source code under the GPLv2 license, using a strict open-source agreement to protect DragonOS.
+- **Independent Rust Kernel**: Core subsystems are written in Rust, significantly reducing memory-safety vulnerabilities at the language level and improving system stability under multi-tenant, high-concurrency workloads.
+- **Streamlined Cloud-Native Guest Architecture**: Purpose-built for lightweight cloud computing and Guest OS environments, keeping device models (such as VirtIO), scheduling, networking, and isolation mechanisms clean and efficient, while actively advancing cloud platform integration and multi-architecture support (such as RISC-V).
+- **Continuously Evolving Linux Compatibility**: DragonOS is steadily expanding its syscall and kernel interface coverage to improve compatibility with production-grade Linux applications and containerized workloads. You can track the latest compatibility test results on the [DragonOS CI Dashboard](https://ci-dashboard.dragonos.org).
 
-You may be interested in the features that have already been implemented in DragonOS. You can visit here: [Features](/introduction/features.html#_genreal_features)
+## Open Source & License
+
+Launched as an open-source project in July 2022, DragonOS is released under the **GPLv2** license. We welcome developers and teams interested in operating system kernels, Agent infrastructure, and cloud-native technologies to join us in building the ecosystem.
+
+If you would like to explore the features already implemented in DragonOS, please visit [Features](/introduction/features.html#_genreal_features).

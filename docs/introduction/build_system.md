@@ -1,5 +1,11 @@
 # Building DragonOS {#_build_dragonos}
 
+::: tip Choosing a Build & Experience Workflow
+- **Local Development (Recommended)**: Use the `tools/bootstrap.sh` setup script below with `make run` / `make run-nographic` (supports full Docker RootFS Manifest customization).
+- **Zero-Config Cloud Experience**: Try the latest nightly build on [DragonOS Playground](https://cnb.cool/DragonOS-Community/playground).
+- **Alternative Isolated Environments**: You can also use [Nix](/introduction/develop_nix.html) or [VS Code Devcontainer](/introduction/devcontainer.html).
+:::
+
 ## 0. Quick Experience
 
 If you just want to quickly experience DragonOS without local development, we strongly recommend using **DragonOS Playground** for cloud-native development. This method is **zero-configuration and one-click startup**, requiring no local dependencies installation, allowing you to experience the latest nightly build of DragonOS in the cloud.

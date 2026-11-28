@@ -1,6 +1,12 @@
-# 添加程序/添加自定义程序！
+# 在 Nix 中添加内置程序
 
-由于新的 userland 构建采用了 nix 来管理，添加程序变得非常的简单！下面我们自顶向下地讲解如何添加程序进 DragonOS 里跑
+::: tip 选择合适的部署方式
+如果你只是想把自己的程序或文件放进 DragonOS 运行，**无需学习 Nix**，推荐直接使用「本地 Docker 镜像 + RootFS Manifest」的方式，详见 [应用开发与部署指南](/zh/userland/appdev/) 与 [RootFS Manifest 配置](/zh/userland/rootfs/dadk-rootfs-manifest.html#_dadk_rootfs_manifest)。
+
+本文仅面向使用 **Nix 构建链路**（`nix run .#yolo-*` / `nix run .#rootfs-*`）或需要将程序长期集成进仓库 `user/apps/` 的开发者。
+:::
+
+由于 Nix 构建链路采用 Nix 管理用户态软件包，下面自顶向下地讲解如何在 Nix 中添加程序进 DragonOS 里运行。
 
 ## 概念
 

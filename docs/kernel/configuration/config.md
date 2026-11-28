@@ -1,99 +1,71 @@
 # Kernel Compilation Configuration Guide
 
-## Principle
+DragonOS kernel compilation is configured through **Cargo Features** and **Makefile / `env.mk` environment variables**. The legacy `kernel.config` / `d.config` mechanism is no longer used.
 
-Within the kernel directory, the kernel configuration is set using `kernel.config`. This file is parsed in a manner similar to a TOML file, and then the configuration of each module's `d.config` is parsed to determine the status of features.
+## Cargo Features Configuration
 
-## Example
+Compile-time feature flags for the kernel are defined under the `[features]` section of `kernel/Cargo.toml`.
 
-**kernel.config**
+### Default Features
 
-```toml
-[[module.include]]
-name = "init"
-path = "src/init/"
-enable = "y"
-description = ""
+| Feature | Description |
+| --- | --- |
+| `fatfs` | Enables FAT filesystem support |
+| `fatfs-secure` | Enables FAT security-related options (depends on `fatfs`) |
+| `kvm` | Enables basic in-kernel KVM virtualization support |
+| `kstack_protect` | Enables kernel stack protection to help detect stack overflows (doubles kernel stack memory usage) |
+| `static_keys_test` | Enables static keys test support |
 
-[[module.include]]
-name = "mm"
-path = "src/mm/"
-enable = "y"
-description = ""
-```
+### Optional & Test Features
 
-- **[[module.include]]:** Adds the module to the include list
-- **name:** Module name
-- **path:** Module path, where the `d.config` file is located
-- **enable:**
-  - **y:** Enabled, parse the `d.config` file of the module
-  - **n:** Disabled, do not parse
-- **description:** Description of the module
+The following features are disabled by default and can be enabled on demand:
 
-**src/mm/d.config**
+| Feature | Category | Description |
+| --- | --- | --- |
+| `initram` | Optional | Enables initramfs support (used together with `INITRAM_PATH`) |
+| `driver_ps2_mouse` | Optional | Enables the PS/2 mouse driver |
+| `mm_selftest` | Self-test | Controlled MM/DMA stress tests and fault-injection self-tests |
+| `sched_selftest` | Self-test | Scheduler group-selection and CPU affinity regression self-tests |
+| `cred_selftest` | Self-test | Process credential (`cred`) scope regression self-tests |
+| `kprobe_test` | Self-test | kprobe functional tests |
+| `fifo_demo` | Debug Demo | Per-CPU FIFO real-time runqueue smoke test |
 
-```toml
-[module]
-name = "mm"
-description = ""
+### Enabling or Modifying Features
 
-[[module.include]]
-name = "allocator"
-path = "src/mm/allocator/"
-enable = "y"
-description = ""
+- **Append features at build time (Recommended)**: Pass extra features via the `KERNEL_FEATURES` environment variable (comma-separated). The build system forwards them to `cargo build --features`:
 
-[[module.features]]
-name = "mm_debug"
-enable = "y"
-description = ""
-```
+  ```bash
+  # Enable a single self-test feature
+  make kernel KERNEL_FEATURES=mm_selftest
 
-- **[module]:** Current module
-  - **name:** Name of the current module
-  - **description:** Description of the module
-- **[[module.include]]:** Modules included in the current module, same as in `kernel.config`
-- **[[module.features]]:** Features in the current module
-  - **name:** Feature name
-  - **enable:** Whether the feature is enabled
-    - **y:** Enabled
-    - **n:** Disabled
-  - **description:** Description of the feature
+  # Enable multiple features at once
+  make kernel KERNEL_FEATURES="mm_selftest,sched_selftest"
+  ```
 
-*The following are the `d.config` files of other modules:*
+- **Modify default features**: To persistently enable or disable a default feature (such as `kstack_protect`), edit the `default` list in `kernel/Cargo.toml` directly.
 
-**src/mm/allocator/d.config**
+## Common Build Environment Variables
 
-```toml
-[module]
-name = "allocator"
-description = ""
+In addition to Cargo features, you can customize the build via command-line variables or by editing `env.mk` in the repository root:
 
-[[module.features]]
-name = "allocator_debug"
-enable = "y"
-description = ""
-```
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARCH` | `x86_64` | Target architecture: `x86_64`, `riscv64`, or `loongarch64` (see [Target Architecture Configuration](/kernel/configuration/arch.html)) |
+| `KERNEL_FEATURES` | Empty | Additional kernel Cargo features to enable (comma-separated) |
+| `ROOTFS_MANIFEST` | `ubuntu2404` (`x86_64`)<br>`default` (other archs) | RootFS manifest name under `config/rootfs-manifests/` |
+| `UNWIND_ENABLE` | `yes` (`no` on `loongarch64`) | Whether to enable kernel stack unwinding (`.eh_frame` and `panic=unwind`) |
+| `INITRAM_PATH` | `$(ROOT_PATH)/x86.cpio.xz` | Path to the initramfs image, used with the `initram` feature |
+| `SKIP_GRUB` | `0` (`1` in CI) | Set to `1` to skip automatic GRUB installation, useful in CI or nographic/serial runs |
 
-**src/init/d.config**
+### Usage Examples
 
-```toml
-[module]
-name = "init"
-description = ""
+```bash
+# Build the kernel with default configuration
+make kernel
 
-[[module.features]]
-name = "init_debug"
-enable = "y"
-description = ""
-```
+# Build with kernel stack unwinding disabled
+make kernel UNWIND_ENABLE=no
 
-All features enabled in the `d.config` files of the activated modules will be ultimately generated into the `D.config` file in the kernel directory. That is, `D.config` is the final kernel compilation configuration, as follows:
-
-**D.config**
-
-```
-init_debug = y
-allocator_debug = y
-mm_debug = y
+# Build for a specific architecture with an extra feature
+make kernel ARCH=riscv64 KERNEL_FEATURES=kprobe_test
 ```

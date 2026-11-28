@@ -1,40 +1,51 @@
-# Common Issues During Build
+# Common Build Issues
 
-Common issues encountered during the build of DragonOS and their solutions.
+This page summarizes common issues encountered when building and running DragonOS and how to resolve them.
 
-## 1. Error Indicates Missing Toolchain
+## 1. Missing Toolchain or Version Mismatch
 
-### Question Detail
+### Symptom
 
-During the build, if you encounter an error like `xxxx not found`, it is typically due to the absence of the necessary compiler toolchain.
+Build fails with `xxxx not found` or a Rust toolchain version mismatch error.
 
-### Answer
+### Solution
 
-If you were previously able to compile the code, but after pulling the latest code, you encounter this error, it is likely because the upstream code has updated its requirements for the toolchain. You can try the following steps to resolve this issue:
+If builds previously succeeded and broke after pulling the latest commits, upstream toolchain requirements have likely been updated. Re-run the bootstrap script to update your environment:
 
 ```shell
 cd tools
 bash bootstrap.sh
 ```
 
-Then, restart the terminal and re-run the build command.
+Open a new terminal and re-run the build. `bootstrap.sh` is designed to be idempotent and safe to re-run at any time.
 
-*Note:* The `bootstrap.sh` script is designed to be "re-runnable". It can be executed at any time to install the latest required toolchain on your system.
+## 2. Disk Image Write Failure or Stale Contents
 
-## 2. Disk Image Write Failure
+### Symptom
 
-### Question Detail
+- Userspace files inside the disk image do not match expectations.
+- Symlink conflict errors occur during disk image creation (for example, a directory became a symlink in a newer base image).
+- Certain applications are missing from the generated image.
 
-- During the build of user programs, the content inside the disk image is inconsistent with the actual content.
-- Errors related to symbolic links are reported.
-- Some applications are not correctly installed into the image.
+### Solution
 
-### Answer
+1. Check that sufficient disk space and permissions are available.
+2. If you switched `ROOTFS_MANIFEST` or updated a custom image, run `make prepare_rootfs_manifest` to verify the resolved configuration.
+3. If stale build artifacts remain, removing `bin/` and rebuilding resolves most issues:
 
-If you encounter a disk image write failure during the build process, it could be due to insufficient disk space or permission issues. It could also be due to changes in directory attributes.
+```shell
+rm -rf bin/
+make write_diskimage
+```
 
-A typical example is when a folder under `bin/sysroot/xxx` is actually a directory, but the new version of the application expects the directory `xxx` to be treated as a symbolic link.
+## 3. RootFS Manifest Architecture Mismatch or Image Pull Failure
 
-In such a case, you can first check whether there is an issue with the script used to compile your application. If you confirm that there is no problem, you can try the following steps:
+### Symptom
 
-- Delete the `bin/` directory and rebuild. This can resolve most of the issues.
+- `Error: ARCH mismatch, env ARCH=..., rootfs manifest arch=...`
+- Pulling a base Docker image such as `ubuntu:24.04` times out or fails.
+
+### Solution
+
+- **Architecture mismatch**: The `ubuntu2404` and `docker` manifests target `x86_64`. When building for `riscv64` or `loongarch64`, use `ROOTFS_MANIFEST=default` (or set `metadata.arch` in your custom manifest accordingly).
+- **Image pull failure**: Verify that the Docker daemon is running and your user has permission to run `docker`. In restricted networks, pre-pull or locally `docker build` the base image—the default `pull_policy = "if-not-present"` uses local images directly.

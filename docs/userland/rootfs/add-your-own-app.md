@@ -1,6 +1,12 @@
-# Add Programs / Add Custom Programs!
+# Adding Built-in Programs in Nix
 
-Thanks to the new userland build system using Nix for management, adding programs has become extremely simple. Below, we'll explain from top to bottom how to add programs to run in DragonOS.
+::: tip Choosing the Right Deployment Method
+If you simply want to run your own applications or files inside DragonOS, **you do not need Nix**. We recommend using a local Docker image with a RootFS Manifest instead—see the [Application Development & Deployment Guide](/userland/appdev/) and [RootFS Manifest Configuration](/userland/rootfs/dadk-rootfs-manifest.html#_dadk_rootfs_manifest).
+
+This guide is intended for developers using the **Nix build pipeline** (`nix run .#yolo-*` / `nix run .#rootfs-*`) or integrating built-in programs directly into `user/apps/`.
+:::
+
+Because the Nix userland pipeline manages packages with Nix, the sections below explain from top to bottom how to add programs to run in DragonOS via Nix.
 
 ## Concepts
 

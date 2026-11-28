@@ -4,6 +4,7 @@ export const zhSidebar = [
       collapsed: false,
       items: [
       { text: 'DragonOS简介', link: '/zh/introduction/' },
+      { text: '功能特性', link: '/zh/introduction/features' },
       { text: '构建DragonOS', link: '/zh/introduction/build_system' },
       { text: '使用 nix 开发 DragonOS', link: '/zh/introduction/develop_nix' },
       { text: '使用 devcontainer 开发 DragonOS', link: '/zh/introduction/devcontainer' },
@@ -17,7 +18,6 @@ export const zhSidebar = [
       {
         text: '内核编译配置',
         collapsed: true,
-        link: '/zh/kernel/configuration/',
         items: [
         { text: '内核编译配置说明', link: '/zh/kernel/configuration/config' },
         { text: '目标架构配置', link: '/zh/kernel/configuration/arch' }
@@ -26,7 +26,6 @@ export const zhSidebar = [
       {
         text: '引导加载',
         collapsed: true,
-        link: '/zh/kernel/boot/',
         items: [
         { text: '引导加载程序', link: '/zh/kernel/boot/bootloader' },
         { text: '内核启动命令行参数', link: '/zh/kernel/boot/cmdline' }
@@ -35,7 +34,6 @@ export const zhSidebar = [
       {
         text: '核心API文档',
         collapsed: true,
-        link: '/zh/kernel/core_api/',
         items: [
         { text: 'DragonOS内核核心API', link: '/zh/kernel/core_api/kernel_api' },
         { text: '原子变量', link: '/zh/kernel/core_api/atomic' },
@@ -47,7 +45,6 @@ export const zhSidebar = [
       {
         text: '中断与下半部',
         collapsed: true,
-        link: '/zh/kernel/interrupt/',
         items: [
         { text: 'tasklet', link: '/zh/kernel/interrupt/tasklet' },
         { text: 'DragonOS Workqueue 机制设计文档', link: '/zh/kernel/interrupt/workqueue' }
@@ -56,7 +53,6 @@ export const zhSidebar = [
       {
         text: '锁',
         collapsed: true,
-        link: '/zh/kernel/locking/',
         items: [
         { text: '锁的类型及其规则', link: '/zh/kernel/locking/locks' },
         { text: '自旋锁', link: '/zh/kernel/locking/spinlock' },
@@ -68,7 +64,6 @@ export const zhSidebar = [
       {
         text: 'RCU',
         collapsed: true,
-        link: '/zh/kernel/rcu/',
         items: [
         { text: 'DragonOS RCU 架构', link: '/zh/kernel/rcu/architecture' },
         { text: 'RCU 分段回调队列', link: '/zh/kernel/rcu/segmented-callback-queues' },
@@ -78,7 +73,6 @@ export const zhSidebar = [
       {
         text: '进程管理模块',
         collapsed: true,
-        link: '/zh/kernel/process_management/',
         items: [
         { text: 'kthread 内核线程', link: '/zh/kernel/process_management/kthread' },
         { text: '加载程序', link: '/zh/kernel/process_management/load_binary' },
@@ -88,7 +82,6 @@ export const zhSidebar = [
       {
         text: 'DragonOS调度',
         collapsed: true,
-        link: '/zh/kernel/sched/',
         items: [
         { text: '进程调度器相关的api', link: '/zh/kernel/sched/core' },
         { text: '完全公平调度器相关的api', link: '/zh/kernel/sched/cfs' },
@@ -101,7 +94,6 @@ export const zhSidebar = [
       {
         text: '进程间通信',
         collapsed: true,
-        link: '/zh/kernel/ipc/',
         items: [
         { text: 'Signal信号', link: '/zh/kernel/ipc/signal' },
         { text: 'IPC Namespace', link: '/zh/kernel/ipc/ipc_namespace' },
@@ -111,7 +103,6 @@ export const zhSidebar = [
       {
         text: '内存管理',
         collapsed: true,
-        link: '/zh/kernel/memory_management/',
         items: [
         { text: '内存管理模块简介', link: '/zh/kernel/memory_management/intro' },
         { text: '内存分配指南', link: '/zh/kernel/memory_management/allocate-memory' },
@@ -123,7 +114,6 @@ export const zhSidebar = [
       {
         text: '文件系统',
         collapsed: true,
-        link: '/zh/kernel/filesystem/',
         items: [
         { text: '概述', link: '/zh/kernel/filesystem/overview' },
         { text: 'DragonOS inotify：用户语义与架构设计', link: '/zh/kernel/filesystem/inotify' },
@@ -132,18 +122,15 @@ export const zhSidebar = [
         {
           text: 'VFS虚拟文件系统',
           collapsed: true,
-          link: '/zh/kernel/filesystem/vfs/',
           items: [
           { text: '设计', link: '/zh/kernel/filesystem/vfs/design' },
           { text: '挂载传播性机制', link: '/zh/kernel/filesystem/vfs/mount_propagation' },
-          { text: 'VFS API文档', link: '/zh/kernel/filesystem/vfs/api' },
           { text: '可挂载文件系统', link: '/zh/kernel/filesystem/vfs/mountable_fs' }
           ]
         },
         {
           text: 'ProcFS',
           collapsed: true,
-          link: '/zh/kernel/filesystem/proc/',
           items: [
           { text: 'Proc 挂载导出接口', link: '/zh/kernel/filesystem/proc/mounts' }
           ]
@@ -153,7 +140,6 @@ export const zhSidebar = [
         {
           text: '联合文件系统',
           collapsed: true,
-          link: '/zh/kernel/filesystem/unionfs/',
           items: [
           { text: 'overlayfs', link: '/zh/kernel/filesystem/unionfs/overlayfs' }
           ]
@@ -163,7 +149,6 @@ export const zhSidebar = [
       {
         text: '内核调试模块',
         collapsed: true,
-        link: '/zh/kernel/debug/',
         items: [
         { text: '内核栈traceback', link: '/zh/kernel/debug/traceback' },
         { text: '如何使用GDB调试内核', link: '/zh/kernel/debug/debug-kernel-with-gdb' },
@@ -173,7 +158,6 @@ export const zhSidebar = [
       {
         text: '内核测试',
         collapsed: true,
-        link: '/zh/kernel/ktest/',
         items: [
         { text: 'dunitest 用户态测试框架', link: '/zh/kernel/ktest/dunitest' },
         { text: 'gVisor 系统调用测试', link: '/zh/kernel/ktest/gvisor_syscall_test' }
@@ -182,12 +166,10 @@ export const zhSidebar = [
       {
         text: '处理器架构',
         collapsed: true,
-        link: '/zh/kernel/cpu_arch/',
         items: [
         {
           text: 'x86-64相关文档',
           collapsed: true,
-          link: '/zh/kernel/cpu_arch/x86_64/',
           items: [
           { text: 'USB Legacy支持', link: '/zh/kernel/cpu_arch/x86_64/usb_legacy_support' }
           ]
@@ -195,20 +177,9 @@ export const zhSidebar = [
         ]
       },
       {
-        text: '容器化',
-        collapsed: true,
-        link: '/zh/kernel/container/',
-        items: [
-        { text: '联合文件系统', link: '/zh/kernel/filesystem/unionfs/' }
-        ]
-      },
-      {
         text: '其他内核库',
         collapsed: true,
-        link: '/zh/kernel/libs/',
         items: [
-        { text: '屏幕管理器（SCM）', link: '/zh/kernel/libs/lib_ui/scm' },
-        { text: '文本显示框架（textui）', link: '/zh/kernel/libs/lib_ui/textui' },
         { text: 'unified-init 统一初始化库', link: '/zh/kernel/libs/unified-init' },
         { text: 'ID分配', link: '/zh/kernel/libs/id-allocation' }
         ]
@@ -216,7 +187,6 @@ export const zhSidebar = [
       {
         text: '网络子系统',
         collapsed: true,
-        link: '/zh/kernel/net/',
         items: [
         { text: 'Internet Protocol Socket', link: '/zh/kernel/net/inet' },
         { text: 'UNIX', link: '/zh/kernel/net/unix' },
@@ -227,7 +197,6 @@ export const zhSidebar = [
       {
         text: '内核跟踪机制',
         collapsed: true,
-        link: '/zh/kernel/trace/',
         items: [
         { text: 'Tracepoints', link: '/zh/kernel/trace/tracepoint' },
         { text: 'DragonOS 运行时文本修补：原理、使用与安全边界', link: '/zh/kernel/trace/text_patching' },
@@ -239,7 +208,6 @@ export const zhSidebar = [
       {
         text: '系统调用',
         collapsed: true,
-        link: '/zh/kernel/syscall/',
         items: [
         { text: '系统调用表实现方案', link: '/zh/kernel/syscall/syscall_table' },
         { text: 'sys_capget / sys_capset 设计说明', link: '/zh/kernel/syscall/sys_capget_capset' }
@@ -248,7 +216,6 @@ export const zhSidebar = [
       {
         text: '设备',
         collapsed: true,
-        link: '/zh/kernel/device/',
         items: [
         { text: 'Linux tty设备', link: '/zh/kernel/device/tty' },
         { text: 'Loop Device 架构设计', link: '/zh/kernel/device/loop_device' }
@@ -261,24 +228,17 @@ export const zhSidebar = [
       collapsed: false,
       items: [
       {
-        text: '用户态构建文档（DADK）',
-        collapsed: true,
-        link: '/zh/userland/appdev/',
-        items: [
-        { text: 'Rust应用开发快速入门', link: '/zh/userland/appdev/rust-quick-start' },
-        { text: '为DragonOS开发C/C++应用', link: '/zh/userland/appdev/c-cpp-quick-start' },
-        { text: '快速使用DADK打包一个应用到DragonOS', link: 'https://docs.dragonos.org.cn/p/dadk/user-manual/quickstart.html' },
-        { text: 'DADK完整文档', link: 'https://docs.dragonos.org.cn/p/dadk/' }
-        ]
+        text: '应用开发与部署',
+        link: '/zh/userland/appdev/'
       },
       {
-        text: '用户态构建文档（Nix）',
+        text: 'RootFS 构建与配置',
         collapsed: true,
         link: '/zh/userland/rootfs/',
         items: [
-        { text: 'DADK RootFS Manifest 配置（非 Nix）', link: '/zh/userland/rootfs/dadk-rootfs-manifest' },
-        { text: '从软件包到RootFS镜像', link: '/zh/userland/rootfs/diskgen' },
-        { text: '添加程序/添加自定义程序！', link: '/zh/userland/rootfs/add-your-own-app' }
+        { text: 'RootFS Manifest 配置（Docker 镜像 / DADK）', link: '/zh/userland/rootfs/dadk-rootfs-manifest' },
+        { text: '从软件包到 RootFS 镜像（Nix）', link: '/zh/userland/rootfs/diskgen' },
+        { text: '在 Nix 中添加内置程序', link: '/zh/userland/rootfs/add-your-own-app' }
         ]
       }
       ]
@@ -298,7 +258,6 @@ export const zhSidebar = [
       {
         text: '常见问题解答',
         collapsed: true,
-        link: '/zh/questions/',
         items: [
         { text: '构建错误常见问题解答', link: '/zh/questions/build_errors' }
         ]
@@ -312,11 +271,10 @@ export const zhSidebar = [
       {
         text: '参与开发',
         collapsed: true,
-        link: '/zh/community/code_contribution/',
         items: [
         { text: '如何参与贡献', link: 'https://community.dragonos.org/contributors/' },
-        { text: 'C语言代码风格', link: '/zh/community/code_contribution/c-coding-style' },
         { text: 'Rust语言代码风格', link: '/zh/community/code_contribution/rust-coding-style' },
+        { text: 'C语言代码风格', link: '/zh/community/code_contribution/c-coding-style' },
         { text: '代码提交规范', link: '/zh/community/code_contribution/conventional-commit' }
         ]
       },
@@ -324,7 +282,6 @@ export const zhSidebar = [
       {
         text: '发行日志',
         collapsed: true,
-        link: '/zh/community/ChangeLog/',
         items: [
         { text: 'V0.4.0', link: '/zh/community/ChangeLog/V0.4.x/V0.4.0' },
         { text: 'V0.3.0', link: '/zh/community/ChangeLog/V0.3.x/V0.3.0' },

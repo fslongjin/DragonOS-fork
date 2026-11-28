@@ -79,7 +79,10 @@ export default withMermaid(
         themeConfig: {
           nav: [
             { text: 'Home', link: '/' },
-            { text: 'Kernel', link: '/kernel/configuration/' },
+            { text: 'Introduction', link: '/introduction/' },
+            { text: 'Kernel', link: '/kernel/configuration/config' },
+            { text: 'App Dev', link: '/userland/appdev/' },
+            { text: 'CI Dashboard', link: 'https://ci-dashboard.dragonos.org' },
           ],
           sidebar: enSidebar,
           outline: { label: 'On this page' },
@@ -97,7 +100,10 @@ export default withMermaid(
         themeConfig: {
           nav: [
             { text: '首页', link: '/zh/' },
-            { text: '内核', link: '/zh/kernel/configuration/' },
+            { text: '入门', link: '/zh/introduction/' },
+            { text: '内核', link: '/zh/kernel/configuration/config' },
+            { text: '应用开发', link: '/zh/userland/appdev/' },
+            { text: 'CI Dashboard', link: 'https://ci-dashboard.dragonos.org' },
           ],
           sidebar: zhSidebar,
           outline: { label: '本页目录' },

@@ -2,29 +2,42 @@
 
 ## Supported Architectures
 
-- x86_64
-- riscv64
+DragonOS currently supports the following 64-bit architectures:
 
-## Architecture-Specific Configuration
+- **`x86_64`** (default, primary supported architecture)
+- **`riscv64`**
+- **`loongarch64`**
 
-In order to support the debugging functionality of VSCode, we need to modify the following line in the `.vscode/settings.json` file:
+## Switching Target Architecture
+
+### 1. Override via Command Line (Recommended)
+
+Specify the target architecture directly with the `ARCH` environment variable when building:
+
+```bash
+make kernel ARCH=x86_64
+make kernel ARCH=riscv64
+make kernel ARCH=loongarch64
 ```
-    "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
-    // "rust-analyzer.cargo.target": "x86_64-unknown-none",
-```
 
-If you want to compile for the x86_64 architecture, enable the x86_64 line and comment out the others.
-If you want to compile for the riscv64 architecture, enable the riscv64 line and comment out the others.
+### 2. Change the Default Architecture
 
-At the same time, we also need to modify the environment variable configuration in the makefile:
+To persistently change the default architecture, edit `env.mk` in the repository root:
 
-Please modify the following line in the `env.mk` file:
-```Makefile
+```makefile
 ifeq ($(ARCH), )
-# ！！！！在这里设置ARCH，可选x86_64和riscv64
-# !!!!!!!如果不同时调整这里以及vscode的settings.json，那么自动补全和检查将会失效
-export ARCH=riscv64
+# Supported: x86_64, riscv64, loongarch64
+export ARCH?=x86_64
 endif
 ```
 
-Please note that changing the architecture requires a recompilation, so please run `make clean` to clean up the compilation results. Then run `make run` to proceed.
+If you develop the kernel with VS Code and `rust-analyzer`, also update `rust-analyzer.cargo.target` in `.vscode/settings.json` so code completion and diagnostics match your chosen architecture:
+
+- `x86_64`: `kernel/src/arch/x86_64/x86_64-unknown-none.json` (or `x86_64-unknown-none`)
+- `riscv64`: `kernel/src/arch/riscv64/riscv64gc-unknown-none-elf.json` (or `riscv64gc-unknown-none-elf`)
+- `loongarch64`: `kernel/src/arch/loongarch64/loongarch64-unknown-none.json`
+
+## Notes
+
+- Default RootFS manifests differ by architecture: `x86_64` defaults to `ROOTFS_MANIFEST=ubuntu2404`, while other architectures default to `ROOTFS_MANIFEST=default` (see `config/rootfs-manifests/`).
+- After switching architectures, run `make clean` to clear previous build artifacts before rebuilding.
